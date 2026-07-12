@@ -1,0 +1,38 @@
+{
+  "name": "robinhood-lp-bot",
+  "version": "2.0.0",
+  "description": "Uniswap v3 LP bot for Robinhood Chain, driven from Telegram. TypeScript + Uniswap SDK.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env --import tsx src/index.ts",
+    "dev": "node --env-file-if-exists=.env --watch --import tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "keywords": [
+    "uniswap",
+    "v3",
+    "liquidity",
+    "telegram",
+    "robinhood-chain"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@uniswap/sdk-core": "^5.9.0",
+    "@uniswap/v3-sdk": "^3.19.0",
+    "@uniswap/v4-sdk": "^2.3.0",
+    "ethers": "^6.13.4",
+    "jsbi": "^3.2.5",
+    "ws": "^8.21.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

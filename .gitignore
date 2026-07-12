@@ -1,0 +1,34 @@
+# ── SECRETS — jangan pernah commit ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+keypair*
+secrets*.json
+# GMGN keypair / config, OpenRouter key, wallet private key semuanya di luar repo (.env / ~/.config)
+
+# deps & build
+node_modules/
+dist/
+
+# runtime state (PnL history + posisi live — back up sendiri, jangan commit)
+data/
+positions.json
+lp-ledger.json
+watch-history.json
+v4-positions.json
+autolp-state.json
+*.lock
+
+# logs
+*.log
+bot.log
+
+# installed agent skills (GMGN CLI skills — buat pakai interaktif, bukan bagian bot)
+.agents/
+skills-lock.json
+
+# Claude Code local (skills, settings)
+.claude/
