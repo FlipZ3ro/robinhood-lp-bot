@@ -17,39 +17,45 @@ export interface LlmVerdict {
 
 export async function llmScore(system: string, user: string): Promise<LlmVerdict | null> {
   if (!env.openrouterKey) return null;
-  try {
-    const res = await fetch(URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.openrouterKey}`,
-        "Content-Type": "application/json",
-        "X-Title": "Robinhood LP Bot",
-      },
-      body: JSON.stringify({
-        model: env.openrouterModel,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        response_format: { type: "json_object" },
-        temperature: 0.2,
-        max_tokens: 1200, // reasoning models spend tokens thinking before the JSON
-      }),
-      signal: AbortSignal.timeout(40_000),
-    });
-    if (!res.ok) {
-      log.warn(`openrouter HTTP ${res.status}`);
+  const body = JSON.stringify({
+    model: env.openrouterModel,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.2,
+    max_tokens: 1200,
+  });
+  // Free models throttle upstream (HTTP 429 with Retry-After) — retry once, briefly.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.openrouterKey}`, "Content-Type": "application/json", "X-Title": "Robinhood LP Bot" },
+        body,
+        signal: AbortSignal.timeout(40_000),
+      });
+      if (res.status === 429 && attempt === 0) {
+        const wait = Math.min(8000, (Number(res.headers.get("retry-after")) || 5) * 1000);
+        log.warn(`openrouter 429 (free throttle) — retry in ${wait}ms`);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      if (!res.ok) {
+        log.warn(`openrouter HTTP ${res.status}`);
+        return null;
+      }
+      const j: any = await res.json();
+      const msg = j?.choices?.[0]?.message ?? {};
+      // reasoning models sometimes leave content null and put the answer in `reasoning`
+      return parseVerdict(msg.content || msg.reasoning || "");
+    } catch (e) {
+      log.warn(`openrouter gagal: ${(e as Error).message}`);
       return null;
     }
-    const j: any = await res.json();
-    const msg = j?.choices?.[0]?.message ?? {};
-    // reasoning models sometimes leave content null and put the answer in `reasoning`
-    const content: string = msg.content || msg.reasoning || "";
-    return parseVerdict(content);
-  } catch (e) {
-    log.warn(`openrouter gagal: ${(e as Error).message}`);
-    return null;
   }
+  return null;
 }
 
 function parseVerdict(content: string): LlmVerdict | null {
