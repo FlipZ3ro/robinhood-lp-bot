@@ -11,6 +11,7 @@ import { wallet, provider } from "../client.js";
 import { tokenMeta } from "../tokens.js";
 import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { NATIVE } from "./poolkey.js";
+import { bsFetch } from "../blockscout.js";
 import { dataPath, readJson } from "../../util/files.js";
 import { logger } from "../../util/log.js";
 
@@ -39,8 +40,23 @@ function signed24(v: number): number {
 export async function listV4Positions(): Promise<V4Row[]> {
   if (!C.v4PositionManager || !C.v4StateView) return [];
   const w = wallet();
+  // The v4 PositionManager is NOT ERC721Enumerable (tokenOfOwnerByIndex reverts), so we
+  // enumerate owned tokenIds via Blockscout's NFT holdings — this catches positions added
+  // MANUALLY on Uniswap too, not just bot-minted ones. Deposit basis (for PnL) still comes
+  // from v4-positions.json where available.
   const deps = readJson<Record<string, { depositWei: string; ts: number }>>(dataPath("v4-positions.json"), {});
-  const ids = Object.keys(deps);
+  const posmL = C.v4PositionManager.toLowerCase();
+  let ids: string[] = [];
+  try {
+    const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
+    ids = (nft?.items ?? [])
+      .filter((i) => (i.token?.address_hash || "").toLowerCase() === posmL)
+      .map((i) => String(i.id));
+  } catch {
+    /* fall back to tracked ids */
+  }
+  // union with tracked ids (in case Blockscout lags a fresh mint)
+  ids = [...new Set([...ids, ...Object.keys(deps)])];
   if (!ids.length) return [];
 
   const posm = new ethers.Contract(C.v4PositionManager, V4_POSM_ABI, provider);
