@@ -353,11 +353,13 @@ export async function onList(mid: number | null = null): Promise<void> {
 
 const LEDGER_PER_PAGE = 5;
 export async function onLedger(page = 0, mid: number | null = null): Promise<void> {
-  const all = readLedger().slice().sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
-  const sum = ledgerSummary();
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
+  const { listClosedV4Positions } = await import("../chain/v4/list.js");
+  const v3all = readLedger().slice().sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+  const v4closed = await listClosedV4Positions().catch(() => [] as Awaited<ReturnType<typeof listClosedV4Positions>>);
+  const sum = ledgerSummary();
 
-  if (!all.length) {
+  if (!v3all.length && !v4closed.length) {
     await out("⏳ <b>Ledger kosong — rebuild dari on-chain…</b>");
     try {
       await backfillLedger();
@@ -365,77 +367,62 @@ export async function onLedger(page = 0, mid: number | null = null): Promise<voi
       await out(`❌ Rebuild gagal: ${short(e, 90)}`);
       return;
     }
-    // STOP if rebuild found nothing — else this recurses forever (wallet with no closed LP)
     if (!readLedger().length) {
-      await out("📒 Belum ada posisi LP yang pernah ditutup.\n<i>Ledger keisi otomatis tiap lu close posisi.</i>");
+      await out("📒 Belum ada posisi LP yang pernah ditutup.\n<i>Keisi otomatis tiap lu close posisi.</i>");
       return;
     }
     return onLedger(page, mid);
   }
 
-  const pages = Math.max(1, Math.ceil(all.length / LEDGER_PER_PAGE));
+  // unified closed list: v3 (rich PnL) + v4 (pair only), one paginated stream
+  type LedRow = { v3?: (typeof v3all)[number]; v4?: (typeof v4closed)[number] };
+  const combined: LedRow[] = [...v3all.map((e) => ({ v3: e })), ...v4closed.map((c) => ({ v4: c }))];
+  const pages = Math.max(1, Math.ceil(combined.length / LEDGER_PER_PAGE));
   page = Math.min(Math.max(0, page), pages - 1);
-  const slice = all.slice(page * LEDGER_PER_PAGE, page * LEDGER_PER_PAGE + LEDGER_PER_PAGE);
+  const slice = combined.slice(page * LEDGER_PER_PAGE, page * LEDGER_PER_PAGE + LEDGER_PER_PAGE);
+  const px = await ethUsd().catch(() => 0);
   const when = (ts: number | null) =>
     ts ? new Date(ts).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "?";
 
   const T: string[] = [];
-  slice.forEach((e, i) => {
+  slice.forEach((row, i) => {
     const n = page * LEDGER_PER_PAGE + i + 1;
     if (i) T.push("");
-    const win = e.pnlEth == null ? "⬜" : e.pnlEth >= 0 ? "🟩" : "🟥";
-    T.push(`${win} ${tokenEmoji(e.sym)} ${e.sym}${e.mode === "inrange" ? "  🎯" : ""}   ${n}/${all.length}`);
-    T.push(`   ${when(e.closedAt)} · hold ${fmtAge(e.heldMs)}`);
-    T.push(`   ${padR("modal", 6)} ${padL((e.depEth ?? 0).toFixed(6) + "Ξ", 11)}`);
-    T.push(`   ${padR("balik", 6)} ${padL((e.outEth ?? 0).toFixed(6) + "Ξ", 11)}`);
-    if (e.pnlEth != null) {
-      T.push(`   ${padR("PnL", 6)} ${padL(sg(e.pnlEth, 6) + "Ξ", 11)}  ${padL(e.pnlUsd != null ? money(e.pnlUsd) : "—", 9)}  ${sg(e.pnlPct ?? 0, 1)}%`);
-    } else T.push(`   ${padR("PnL", 6)} — (modal tak tercatat)`);
-    if ((e.unsoldEth ?? 0) > 0) T.push(`   🪙 nyangkut ${e.tokenKept ? e.tokenKept.toFixed(0) + " " + e.sym : ""} ~${(e.unsoldEth ?? 0).toFixed(6)}Ξ (blm dijual)`);
-    else if (e.tokenRug > 0) T.push(`   ⚠️ ${e.tokenRug.toFixed(0)} ${e.sym} gagal dijual (rug)`);
+    if (row.v3) {
+      const e = row.v3;
+      const win = e.pnlEth == null ? "⬜" : e.pnlEth >= 0 ? "🟩" : "🟥";
+      T.push(`${win} ${tokenEmoji(e.sym)} ${e.sym} · v3${e.mode === "inrange" ? " 🎯" : ""}   ${n}/${combined.length}`);
+      T.push(`   ${when(e.closedAt)} · hold ${fmtAge(e.heldMs)}`);
+      T.push(`   modal ${(e.depEth ?? 0).toFixed(5)}Ξ → balik ${(e.outEth ?? 0).toFixed(5)}Ξ`);
+      if (e.pnlEth != null) T.push(`   PnL ${sg(e.pnlEth, 5)}Ξ  ${e.pnlUsd != null ? money(e.pnlUsd) : "—"}  ${sg(e.pnlPct ?? 0, 1)}%`);
+      else T.push(`   PnL — (modal tak tercatat)`);
+      if ((e.unsoldEth ?? 0) > 0) T.push(`   🪙 nyangkut ~${(e.unsoldEth ?? 0).toFixed(5)}Ξ (blm dijual)`);
+    } else if (row.v4) {
+      const c = row.v4;
+      T.push(`⬜ ${tokenEmoji(c.pair)} ${c.pair} · v4 🦄   ${n}/${combined.length}`);
+      T.push(`   fee ${(c.fee / 10000).toFixed(2)}% · #${c.tokenId}`);
+      T.push(`   PnL — (v4 historis)${c.depEth != null ? ` · modal ${c.depEth.toFixed(5)}Ξ` : ""}`);
+    }
   });
 
-  const px = await ethUsd().catch(() => 0);
   const net = sum.pnlEth + sum.unsoldEth;
   const S: string[] = [];
-  S.push(`${sum.count} POSISI DITUTUP`);
-  S.push("─".repeat(37));
-  S.push(`${padR("menang", 8)} ${padL(`${sum.wins}W / ${sum.losses}L`, 10)}  ${padL(sum.winRate.toFixed(0) + "%", 9)}`);
-  S.push(`${padR("modal", 8)} ${padL(sum.depEth.toFixed(5) + "Ξ", 10)}`);
-  S.push(`${padR("fee LP", 8)} ${padL(sum.feeEth.toFixed(5) + "Ξ", 10)}`);
-  S.push("");
-  S.push(`${padR("REALIZED", 8)} ${padL(sg(sum.pnlEth, 5) + "Ξ", 10)}  ${padL(money(sum.pnlUsd), 9)}`);
-  S.push(`  ETH yang beneran balik ke tangan`);
-  S.push("");
-  S.push(`${padR("nyangkut", 8)} ${padL("+" + sum.unsoldEth.toFixed(5) + "Ξ", 10)}  ${padL("+$" + (sum.unsoldEth * px).toFixed(2), 9)}`);
-  S.push(`  token blm dijual — pakai /sell buat cairin`);
-  S.push("");
-  S.push(`${padR("NET", 8)} ${padL(sg(net, 5) + "Ξ", 10)}  ${padL(money(net * px), 9)}`);
-  S.push(`  kalau semua token nyangkut laku dijual`);
+  S.push(`${combined.length} DITUTUP · ${v3all.length} v3 · ${v4closed.length} v4`);
+  S.push("─".repeat(34));
+  S.push(`${padR("menang", 9)} ${sum.wins}W / ${sum.losses}L · ${sum.winRate.toFixed(0)}%`);
+  S.push(`${padR("modal", 9)} ${sum.depEth.toFixed(5)}Ξ · fee ${sum.feeEth.toFixed(5)}Ξ`);
+  S.push(`${padR("REALIZED", 9)} ${sg(sum.pnlEth, 5)}Ξ · ${money(sum.pnlUsd)}`);
+  if (sum.unsoldEth > 0) S.push(`${padR("nyangkut", 9)} +${sum.unsoldEth.toFixed(5)}Ξ · +$${(sum.unsoldEth * px).toFixed(2)}`);
+  S.push(`${padR("NET", 9)} ${sg(net, 5)}Ξ · ${money(net * px)}`);
 
   const nav: object[] = [];
   if (page > 0) nav.push({ text: "◀️ Back", callback_data: `lg:${page - 1}` });
   nav.push({ text: `${page + 1}/${pages}`, callback_data: `lg:${page}` });
   if (page < pages - 1) nav.push({ text: "Next ▶️", callback_data: `lg:${page + 1}` });
 
-  // v4 closed positions (only on page 0). v4 PnL isn't reconstructable from the singleton
-  // PoolManager the way v3 is, so we list the pairs; PnL shows only where a deposit was tracked.
-  let v4block = "";
-  if (page === 0) {
-    const { listClosedV4Positions } = await import("../chain/v4/list.js");
-    const closed = await listClosedV4Positions().catch(() => []);
-    if (closed.length) {
-      const V: string[] = [`🦄 v4 DITUTUP · ${closed.length} posisi`, "─".repeat(37)];
-      closed.slice(0, 15).forEach((r) => {
-        V.push(`${tokenEmoji(r.pair)} ${r.pair}  fee ${(r.fee / 10000).toFixed(2)}%  #${r.tokenId}${r.depEth != null ? "  modal " + r.depEth.toFixed(4) + "Ξ" : ""}`);
-      });
-      if (closed.length > 15) V.push(`… +${closed.length - 15} lagi`);
-      v4block = pre(V.join("\n")) + `<i>PnL historis v4 nggak direkonstruksi (event di PoolManager singleton).</i>`;
-    }
-  }
-
-  const head = `📒 <b>Ledger LP</b> · ${all.length} v3 ditutup`;
-  await out(head + "\n" + pre(T.join("\n")) + pre(S.join("\n")) + v4block, {
+  const head = `📒 <b>Ledger LP</b> · ${combined.length} posisi ditutup`;
+  const foot = v4closed.length ? `<i>Stats di atas = v3. PnL historis v4 belum direkonstruksi.</i>` : "";
+  await out(head + "\n" + pre(T.join("\n")) + pre(S.join("\n")) + foot, {
     reply_markup: { inline_keyboard: [nav, [{ text: "🔄 Rebuild dari on-chain", callback_data: "lgrb" }]] },
   });
 }
