@@ -178,6 +178,12 @@ export const env = {
   openrouterUrl: process.env.RH_OPENROUTER_URL?.trim() || "https://openrouter.ai/api/v1/chat/completions",
   openrouterModel: process.env.RH_OPENROUTER_MODEL?.trim() || "nvidia/nemotron-3-super-120b-a12b:free",
   gmgnKey: (process.env.RH_GMGN_KEY || "").trim(),
+  // KyberSwap aggregator — best-route swaps (auto multi-hop across all pools/fee-tiers/hooks).
+  // Used to acquire the token side before an in-range LP (far better execution than swapping on
+  // the fee-tier pool you're farming). Router is a hard whitelist: calldata is only ever sent here.
+  kyberBase: (process.env.KYBERSWAP_AGGREGATOR_API_BASE_URL || "https://aggregator-api.kyberswap.com").trim().replace(/\/$/, ""),
+  kyberChain: (process.env.KYBERSWAP_CHAIN || "robinhood").trim(),
+  kyberRouter: (process.env.KYBERSWAP_ROUTER_ADDRESS || "").trim(),
 };
 
 /** Fail fast at startup if a required secret is missing or malformed. */

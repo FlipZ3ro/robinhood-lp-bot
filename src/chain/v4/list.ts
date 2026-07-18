@@ -15,7 +15,7 @@ import { ethUsd } from "../price.js";
 import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { NATIVE } from "./poolkey.js";
 import { bsFetch, mapLimit } from "../blockscout.js";
-import { dataPath, readJson } from "../../util/files.js";
+import { dataPath, readJson, writeJson } from "../../util/files.js";
 import { logger } from "../../util/log.js";
 
 const { Ether, Token, CurrencyAmount } = sdkCore as any;
@@ -48,11 +48,26 @@ export interface V4Row {
 
 const signed24 = (v: number): number => (v >= 0x800000 ? v - 0x1000000 : v);
 
+/** Retry a flaky read a couple times before giving up (transient RPC errors dropped rows). */
+async function retry<T>(fn: () => Promise<T>, n = 3): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < n; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+    }
+  }
+  throw last;
+}
+
 export interface V4ClosedRow {
   tokenId: string;
   pair: string;
   fee: number;
   depEth: number | null; // basis only if bot-minted
+  closedAt: number | null; // latest NFT transfer ts (for recent-first sort)
 }
 
 /** v4 NFTs the wallet still holds but with 0 liquidity = closed positions (for /ledger). */
@@ -60,7 +75,7 @@ export async function listClosedV4Positions(): Promise<V4ClosedRow[]> {
   if (!C.v4PositionManager) return [];
   const w = wallet();
   const posmL = C.v4PositionManager.toLowerCase();
-  const deps = readJson<Record<string, { depositWei: string }>>(dataPath("v4-positions.json"), {});
+  const deps = readJson<Record<string, { depositWei?: string }>>(dataPath("v4-positions.json"), {});
   let ids: string[] = [];
   try {
     const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
@@ -80,12 +95,59 @@ export async function listClosedV4Positions(): Promise<V4ClosedRow[]> {
         pk.currency1.toLowerCase() === NATIVE ? Promise.resolve({ symbol: "ETH" }) : tokenMeta(pk.currency1).catch(() => ({ symbol: "?" })),
       ]);
       const dep = deps[tokenId];
-      return { tokenId, pair: `${m0.symbol}/${m1.symbol}`, fee: Number(pk.fee), depEth: dep ? Number(ethers.formatEther(dep.depositWei)) : null };
+      // most-recent NFT transfer ≈ close time (best-effort, for sorting)
+      let closedAt: number | null = null;
+      try {
+        const tr = await bsFetch<{ items?: any[] }>(`/api/v2/tokens/${C.v4PositionManager}/instances/${tokenId}/transfers`, 8000);
+        const t0 = tr?.items?.[0]?.timestamp;
+        closedAt = t0 ? new Date(t0).getTime() : null;
+      } catch {
+        /* leave null */
+      }
+      return {
+        tokenId,
+        pair: `${m0.symbol}/${m1.symbol}`,
+        fee: Number(pk.fee),
+        depEth: dep?.depositWei ? Number(ethers.formatEther(dep.depositWei)) : null,
+        closedAt,
+      };
     } catch {
       return null;
     }
   });
   return rows.filter((r): r is V4ClosedRow => r !== null);
+}
+
+/**
+ * Original mint timestamp of a v4 position NFT (for positions added manually on the web UI,
+ * where we have no local deposit record → age showed "?"). Read from Blockscout's NFT
+ * instance transfers (the Transfer from 0x0), cached back into v4-positions.json.
+ */
+const v4MintTsCache = new Map<string, number | null>();
+export async function v4MintTs(tokenId: string): Promise<number | null> {
+  const key = String(tokenId);
+  if (v4MintTsCache.has(key)) return v4MintTsCache.get(key)!;
+  const deps = readJson<Record<string, { mintTs?: number }>>(dataPath("v4-positions.json"), {});
+  if (deps[key]?.mintTs) {
+    v4MintTsCache.set(key, deps[key]!.mintTs!);
+    return deps[key]!.mintTs!;
+  }
+  let ts: number | null = null;
+  try {
+    const r = await bsFetch<{ items?: any[] }>(`/api/v2/tokens/${C.v4PositionManager}/instances/${key}/transfers`, 10_000);
+    const items = r?.items ?? [];
+    const mint = items.filter((i) => /^0x0{40}$/i.test(i.from?.hash || "")).pop() ?? items[items.length - 1];
+    ts = mint?.timestamp ? new Date(mint.timestamp).getTime() : null;
+  } catch {
+    /* leave null */
+  }
+  v4MintTsCache.set(key, ts);
+  if (ts) {
+    const d = readJson<Record<string, any>>(dataPath("v4-positions.json"), {});
+    d[key] = { ...(d[key] ?? {}), mintTs: ts };
+    writeJson(dataPath("v4-positions.json"), d);
+  }
+  return ts;
 }
 
 function sdkCurrency(addr: string, dec: number, sym: string): any {
@@ -104,7 +166,7 @@ export async function listV4Positions(): Promise<V4Row[]> {
   if (!C.v4PositionManager || !C.v4StateView) return [];
   const w = wallet();
   const posmL = C.v4PositionManager.toLowerCase();
-  const deps = readJson<Record<string, { depositWei: string; ts: number }>>(dataPath("v4-positions.json"), {});
+  const deps = readJson<Record<string, { depositWei?: string; ts?: number; mintTs?: number }>>(dataPath("v4-positions.json"), {});
   let ids: string[] = [];
   try {
     const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
@@ -113,6 +175,15 @@ export async function listV4Positions(): Promise<V4Row[]> {
     /* fall back to tracked ids */
   }
   ids = [...new Set([...ids, ...Object.keys(deps)])];
+  // Drop tokenIds the ledger already knows are CLOSED — deps accumulates every historical mint
+  // (incl. burned positions), so without this /list pays 2 RPC reads per dead position, every time.
+  try {
+    const { readLedger } = await import("../ledger.js");
+    const closed = new Set(readLedger().filter((e) => e.version === "v4").map((e) => e.tokenId));
+    if (closed.size) ids = ids.filter((id) => !closed.has(id));
+  } catch {
+    /* ledger optional — just skip the prune */
+  }
   if (!ids.length) return [];
 
   const posm = new ethers.Contract(C.v4PositionManager, V4_POSM_ABI, provider);
@@ -120,15 +191,15 @@ export async function listV4Positions(): Promise<V4Row[]> {
   const coder = ethers.AbiCoder.defaultAbiCoder();
   const px = await ethUsd().catch(() => 0);
 
-  const rows = await mapLimit(ids, 6, async (tokenId): Promise<V4Row | null> => {
+  const rows = await mapLimit(ids, 10, async (tokenId): Promise<V4Row | null> => {
     try {
       const [owner, liquidity] = await Promise.all([
-        posm.ownerOf!(tokenId).catch(() => ethers.ZeroAddress) as Promise<string>,
-        posm.getPositionLiquidity!(tokenId).catch(() => 0n) as Promise<bigint>,
+        retry(() => posm.ownerOf!(tokenId) as Promise<string>).catch(() => ethers.ZeroAddress),
+        retry(() => posm.getPositionLiquidity!(tokenId) as Promise<bigint>).catch(() => 0n),
       ]);
       if (owner.toLowerCase() !== w.address.toLowerCase() || liquidity === 0n) return null;
 
-      const [pk, infoRaw] = await posm.getPoolAndPositionInfo!(tokenId);
+      const [pk, infoRaw] = await retry(() => posm.getPoolAndPositionInfo!(tokenId));
       const info = BigInt(infoRaw);
       const tickLower = signed24(Number((info >> 8n) & 0xffffffn));
       const tickUpper = signed24(Number((info >> 32n) & 0xffffffn));
@@ -148,7 +219,7 @@ export async function listV4Positions(): Promise<V4Row[]> {
         [C.v4PositionManager, tickLower, tickUpper, ethers.toBeHex(BigInt(tokenId), 32)],
       );
       const [s0, fgInside, posInfo] = await Promise.all([
-        sv.getSlot0!(poolId),
+        retry(() => sv.getSlot0!(poolId)),
         sv.getFeeGrowthInside!(poolId, tickLower, tickUpper).catch(() => [0n, 0n]),
         sv.getPositionInfo!(poolId, positionId).catch(() => [0n, 0n, 0n]),
       ]);
@@ -183,6 +254,8 @@ export async function listV4Positions(): Promise<V4Row[]> {
 
       const ethPaired = c0.toLowerCase() === NATIVE || c1.toLowerCase() === NATIVE;
       const dep = deps[tokenId];
+      // age: bot deposit ts, else the position's on-chain mint time (manual web adds)
+      const openedAt = dep?.ts ?? dep?.mintTs ?? (await v4MintTs(tokenId).catch(() => null));
       // primary token = the non-stable / non-eth side (for the emoji/label)
       const primary = u0 != null && u1 == null ? m1.symbol : u1 != null && u0 == null ? m0.symbol : m0.symbol;
 
@@ -201,9 +274,9 @@ export async function listV4Positions(): Promise<V4Row[]> {
         sym1: m1.symbol,
         feeUsd,
         valueUsd,
-        depEth: dep ? Number(ethers.formatEther(dep.depositWei)) : null,
+        depEth: dep?.depositWei ? Number(ethers.formatEther(dep.depositWei)) : null,
         ethPaired,
-        ageMs: dep?.ts ? Date.now() - dep.ts : null,
+        ageMs: openedAt ? Date.now() - openedAt : null,
       };
     } catch (e) {
       log.warn(`skip v4 #${tokenId}: ${(e as Error).message.slice(0, 80)}`);

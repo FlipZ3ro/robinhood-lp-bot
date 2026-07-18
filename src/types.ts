@@ -107,6 +107,9 @@ export interface TopUp {
 export interface LedgerEntry {
   tokenId: string;
   sym: string;
+  version?: "v2" | "v3" | "v4"; // absent = v3 (legacy entries)
+  pair?: string; // v4/v2 non-ETH display, e.g. "WOLVES/USDG"
+  quote?: "eth" | "usd"; // display denomination: "usd" for stable-paired pools (USDG); default eth
   mode: MintMode;
   openedAt: number | null;
   closedAt: number | null;

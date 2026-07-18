@@ -124,6 +124,7 @@ export async function lifetimePnl(force = false): Promise<LifetimePnl> {
       return { weth: 0, sellEth, sym: t.symbol || "?", isWeth: false };
     }),
   );
+  const graveSeen = new Set<string>();
   for (const r of valued) {
     if (!r) continue;
     if (r.isWeth) {
@@ -131,7 +132,10 @@ export async function lifetimePnl(force = false): Promise<LifetimePnl> {
       continue;
     }
     tokensEth += r.sellEth;
-    if (r.sellEth * (px || 0) < 1) {
+    // "stuck" = can't be sold for even $1 (rug / no liquidity / honeypot). Dedupe by symbol
+    // so two contracts sharing a ticker (e.g. HASH/HASH) count once.
+    if (r.sellEth * (px || 0) < 1 && !graveSeen.has(r.sym)) {
+      graveSeen.add(r.sym);
       graveyardCount++;
       if (graveyard.length < 12) graveyard.push(r.sym);
     }

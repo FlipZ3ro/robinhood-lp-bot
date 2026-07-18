@@ -3,25 +3,30 @@ import { cfg, env, persist } from "../config.js";
 import { tokenMeta } from "../chain/tokens.js";
 import { findPools } from "../chain/pools.js";
 import { discoverV4Pools, type V4Pool } from "../chain/v4/discover.js";
+import { readV2Pool, type V2Pool } from "../chain/v2/pair.js";
 import { previewRange, openPosition, listPositions, closePosition } from "../chain/positions.js";
 import { readLedger, ledgerSummary, backfillLedger } from "../chain/ledger.js";
 import { lifetimePnl } from "../chain/analytics.js";
 import { balances, sellAllTokens } from "../chain/holdings.js";
+import { tokenBalanceRaw } from "../chain/swaps.js";
 import { ethUsd } from "../chain/price.js";
 import { topVolumeNow, wcfg, usingOwnWatchRpc } from "../watch/scanner.js";
 import { startWatch, stopWatch, restartWatch, isWatchOn } from "./watchLoop.js";
 import { startFeed, stopFeed, feedStatus } from "./feedLoop.js";
 import { autoLpStatus } from "../radar/autolp.js";
-import { send, sendMenu, edit, explorerTx } from "./tg.js";
+import { send, sendMenu, edit, explorerTx, sendPhoto, downloadTgFile } from "./tg.js";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { ethers } from "ethers";
 import { esc, pre, padR, padL, sg, money, tokenEmoji } from "./format.js";
 import { fmtMcap, fmtAge } from "../util/format.js";
 import type { PoolInfo, TokenMeta, MintMode } from "../types.js";
 
-/** Unified candidate pool across Uniswap versions (v3 + v4). */
+/** Unified candidate pool across Uniswap versions (v2 + v3 + v4). */
 interface UPool {
-  version: "v3" | "v4";
+  version: "v2" | "v3" | "v4";
   fee: number;
   liqLabel: string; // display, e.g. "WETH 0.5" or "✅ liq"
+  v2?: V2Pool;
   v3?: PoolInfo;
   v4?: V4Pool;
 }
@@ -32,6 +37,8 @@ interface Pending {
   chosen?: UPool;
   awaitingAmount?: boolean;
   ethAmt?: string;
+  heldTokenUi?: number; // token already in wallet (reused for dual-side)
+  balancedEth?: number; // ETH that balances the held token for a dual-side mint
 }
 let pending: Pending | null = null;
 
@@ -42,28 +49,34 @@ const usableEth = (b: { weth: string; eth: string }): number =>
 // ══════════ open flow ══════════
 
 export async function onCA(addr: string): Promise<void> {
-  await send(`🔎 <b>Cari pool v3 + v4</b> di Robinhood Chain\n<code>${addr}</code>`);
+  await send(`🔎 <b>Cari pool v2 + v3 + v4</b> di Robinhood Chain\n<code>${addr}</code>`);
   let meta: TokenMeta;
   const pools: UPool[] = [];
   try {
     meta = await tokenMeta(addr);
-    // v3 (token/WETH) + v4 (token/ETH) in parallel
-    const [v3, v4] = await Promise.all([
+    const { discoverV4UsdgPools } = await import("../chain/v4/discover.js");
+    // v2/v3 (token/WETH) + v4 (token/ETH) + v4 (token/USDG) in parallel
+    const [v2, v3, v4, v4usd] = await Promise.all([
+      readV2Pool(addr).catch(() => null as V2Pool | null),
       findPools(addr).catch(() => [] as PoolInfo[]),
       discoverV4Pools(addr).catch(() => [] as V4Pool[]),
+      discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]),
     ]);
+    if (v2) pools.push({ version: "v2", fee: 3000, liqLabel: `WETH ${v2.wethInPool.toFixed(3)}`, v2 });
     for (const p of v3) pools.push({ version: "v3", fee: p.fee, liqLabel: `WETH ${p.wethInPool.toFixed(3)}`, v3: p });
-    for (const p of v4) if (p.liquidity > 0n) pools.push({ version: "v4", fee: p.fee, liqLabel: "✅ liq", v4: p });
+    for (const p of v4) if (p.liquidity > 0n) pools.push({ version: "v4", fee: p.fee, liqLabel: "ETH ✅", v4: p });
+    for (const p of v4usd) if (p.liquidity > 0n) pools.push({ version: "v4", fee: p.fee, liqLabel: "USDG ✅", v4: p });
   } catch (e) {
     await send(`❌ Gagal baca token/pool: ${short(e, 80)}`);
     return;
   }
   if (!pools.length) {
-    await send(`⚠️ Tidak ada pool ${meta.symbol} (v3/WETH atau v4/ETH) dengan likuiditas. Belum bisa LP.`);
+    await send(`⚠️ Tidak ada pool ${esc(meta.symbol)} (v2/v3 WETH, v4 ETH/USDG) dengan likuiditas. Belum bisa LP.`);
     return;
   }
-  // sort: highest fee first (memecoin farming preference), v4 before v3 on ties
-  pools.sort((a, b) => b.fee - a.fee || (a.version === "v4" ? -1 : 1));
+  // sort: highest fee first (memecoin farming preference); on ties v4 > v3 > v2
+  const vRank = (v: string) => (v === "v4" ? 0 : v === "v3" ? 1 : 2);
+  pools.sort((a, b) => b.fee - a.fee || vRank(a.version) - vRank(b.version));
   pending = { token: addr, meta, pools };
   const rows = pools.map((p, i) => [
     {
@@ -71,9 +84,10 @@ export async function onCA(addr: string): Promise<void> {
       callback_data: `pool:${i}`,
     },
   ]);
+  const nV2 = pools.filter((p) => p.version === "v2").length;
   const nV3 = pools.filter((p) => p.version === "v3").length;
   const nV4 = pools.filter((p) => p.version === "v4").length;
-  await send(`Ketemu <b>${pools.length}</b> pool ${esc(meta.symbol)} (${nV3} v3 + ${nV4} v4). Pilih:`, {
+  await send(`Ketemu <b>${pools.length}</b> pool ${esc(meta.symbol)} (${nV2} v2 + ${nV3} v3 + ${nV4} v4). Pilih:`, {
     reply_markup: { inline_keyboard: rows },
   });
 }
@@ -84,7 +98,36 @@ export async function onPick(idx: number, mid: number): Promise<void> {
   if (!p) return;
   pending.chosen = p;
   pending.awaitingAmount = true;
-  const b = await balances().catch(() => null);
+  const [b, tokRaw] = await Promise.all([
+    balances().catch(() => null),
+    tokenBalanceRaw(pending.token).catch(() => 0n),
+  ]);
+  // token already in the wallet (e.g. bought on a prior attempt) — in-range LP reuses it, no re-buy
+  const tokUi = tokRaw > 0n ? Number(tokRaw) / 10 ** pending.meta.decimals : 0;
+  pending.heldTokenUi = tokUi;
+
+  // for a v4 dual-side (in-range) mint, compute the ETH that BALANCES the held token so the
+  // two sides fill evenly (no swap, minimal leftover) — this is the "hitungan sama" the user wants
+  let balanced = 0;
+  if (tokUi > 0 && p.version === "v4" && p.v4) {
+    try {
+      const { balancedEthForHeldToken } = await import("../chain/v4/mint.js");
+      balanced = balancedEthForHeldToken(pending.token, pending.meta, p.v4, tokRaw);
+    } catch {
+      /* suggestion is best-effort */
+    }
+  }
+  pending.balancedEth = balanced;
+
+  const reuseLine =
+    tokUi > 0 && (p.version === "v4" || p.version === "v2")
+      ? `♻️ <b>${tokUi.toPrecision(4)} ${esc(pending.meta.symbol)}</b> udah di wallet — bakal <b>dipake ulang</b> (nggak beli lagi).`
+      : "";
+  const balLine = balanced > 0 ? `⚖️ Buat <b>dual-side seimbang</b> sama token itu: pasang <b>~${balanced.toFixed(5)} ETH</b>.` : "";
+  const extra =
+    balanced > 0
+      ? { reply_markup: { inline_keyboard: [[{ text: `⚖️ Dual-side seimbang (~${balanced.toFixed(4)} Ξ)`, callback_data: "ballp" }]] } }
+      : {};
   await edit(
     mid,
     [
@@ -92,12 +135,23 @@ export async function onPick(idx: number, mid: number): Promise<void> {
       b
         ? `Saldo bisa di-LP: <b>${usableEth(b).toFixed(5)} ETH</b>  <i>(WETH ${Number(b.weth).toFixed(4)} + ETH ${Number(b.eth).toFixed(4)})</i>`
         : "",
+      reuseLine,
+      balLine,
       ``,
-      `💬 <b>Ketik jumlah ETH</b> yang mau di-LP (contoh: <code>0.005</code>)`,
+      `💬 <b>Ketik jumlah ETH</b> yang mau di-LP (contoh: <code>0.005</code>)${balanced > 0 ? " — atau tap tombol di bawah." : ""}`,
     ]
       .filter(Boolean)
       .join("\n"),
+    extra,
   );
+}
+
+/** One-tap: dual-side v4 mint with the ETH amount that balances the held token. */
+export async function onBalancedLp(mid: number): Promise<void> {
+  if (!pending?.chosen?.v4 || !pending.balancedEth) return;
+  pending.ethAmt = String(pending.balancedEth);
+  pending.awaitingAmount = false;
+  await onMintV4(mid, "inrange");
 }
 
 export async function onAmount(text: string): Promise<void> {
@@ -123,15 +177,59 @@ export async function onAmount(text: string): Promise<void> {
   pending.ethAmt = String(eth);
   pending.awaitingAmount = false;
 
+  // ── v2 pool → zap (full-range, always both-sided) ──
+  if (pending.chosen.version === "v2") {
+    await send(
+      [
+        `<b>Konfirmasi LP · Uniswap v2</b>`,
+        `${esc(pending.meta.symbol)} · fee <b>0.30%</b> · deposit <b>${eth} ETH</b> · full-range`,
+        ``,
+        `🎯 v2 selalu <b>both-sided 50/50</b>: bot swap ~separuh ETH → ${esc(pending.meta.symbol)}, sisanya jadi pasangan LP. <b>Fee jalan LANGSUNG.</b>`,
+        `⚠️ Langsung pegang token (rug = rugi ~separuh). Nggak ada single-side di v2.`,
+      ].join("\n"),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: `🎯 LP v2 (zap ${eth}Ξ)`, callback_data: "mint:v2" }],
+            [{ text: "❌ Cancel", callback_data: "cancel" }],
+          ],
+        },
+      },
+    );
+    return;
+  }
+
   // ── v4 pool → single-side / in-range (farming) ──
   if (pending.chosen.version === "v4") {
     const feePct = (pending.chosen.fee / 10000).toFixed(2);
+    const isUsd = pending.chosen.v4?.quote === "usd";
+    if (isUsd) {
+      // USDG-paired pool: both sides are ERC20 → only both-sided in-range makes sense.
+      await send(
+        [
+          `<b>Konfirmasi LP · Uniswap v4 · USDG</b> 🦄`,
+          `${esc(pending.meta.symbol)}/USDG · fee <b>${feePct}%</b> · deposit <b>${eth} ETH</b>`,
+          ``,
+          `🎯 <b>In-range (farming)</b> — bot beli USDG + ${esc(pending.meta.symbol)} dari ETH lo (rute terbaik via Kyber), terus mint both-sided. <b>Fee ${feePct}% jalan LANGSUNG.</b>`,
+          `⚠️ Langsung pegang token (rug = rugi). Nggak ada single-side di pair USDG.`,
+        ].join("\n"),
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: `🎯 LP USDG ${feePct}% (${eth}Ξ)`, callback_data: "mint:v4r" }],
+              [{ text: "❌ Cancel", callback_data: "cancel" }],
+            ],
+          },
+        },
+      );
+      return;
+    }
     await send(
       [
         `<b>Konfirmasi mint · Uniswap v4</b> 🦄`,
         `${esc(pending.meta.symbol)} · fee <b>${feePct}%</b> · deposit <b>${eth} ETH</b> · pair native ETH`,
         ``,
-        `🎯 <b>In-range (farming)</b> — swap ~separuh ETH → token, mint di sekitar harga. <b>Fee ${feePct}% jalan LANGSUNG.</b> Tapi langsung pegang token (rug = rugi ~separuh).`,
+        `🎯 <b>In-range (farming)</b> — beli token via rute terbaik (Kyber), mint di sekitar harga. <b>Fee ${feePct}% jalan LANGSUNG.</b> Tapi langsung pegang token (rug = rugi ~separuh).`,
         ``,
         `🛡 <b>Single-side ETH</b> — parkir ETH, range di atas harga. Fee cuma pas harga NAIK masuk range. Aman dari rug.`,
       ].join("\n"),
@@ -183,7 +281,9 @@ export async function onAmount(text: string): Promise<void> {
 }
 
 export async function onMint(mid: number, action = "single"): Promise<void> {
+  invalidateListCache();
   if (!pending?.chosen || !pending.ethAmt) return;
+  if (pending.chosen.version === "v2") return onMintV2(mid);
   if (pending.chosen.version === "v4") return onMintV4(mid, action === "v4r" ? "inrange" : "single");
 
   const mode: MintMode = action === "inrange" ? "inrange" : "single";
@@ -215,15 +315,20 @@ export async function onMint(mid: number, action = "single"): Promise<void> {
 }
 
 async function onMintV4(mid: number, mode: "single" | "inrange"): Promise<void> {
+  invalidateListCache();
   if (!pending?.chosen?.v4 || !pending.ethAmt) return;
   const fee = pending.chosen.v4.fee;
-  const inR = mode === "inrange";
-  await edit(mid, `⏳ <b>Minting v4 ${pending.ethAmt} ETH…</b> ${inR ? "(swap → Permit2 → mint in-range)" : "(simulasi → mint single-side)"}`);
+  const isUsd = pending.chosen.v4.quote === "usd";
+  const inR = mode === "inrange" || isUsd; // USDG pairs are always both-sided in-range
+  const v4pool = pending.chosen.v4;
+  await edit(mid, `⏳ <b>Minting v4 ${pending.ethAmt} ETH…</b> ${isUsd ? "(Kyber → USDG+token → mint)" : inR ? "(swap → Permit2 → mint in-range)" : "(simulasi → mint single-side)"}`);
   try {
-    const { openV4SingleSide, openV4InRange } = await import("../chain/v4/mint.js");
-    const r = inR
-      ? await openV4InRange(pending.token, pending.ethAmt, { fee })
-      : await openV4SingleSide(pending.token, pending.ethAmt, { fee });
+    const { openV4SingleSide, openV4InRange, openV4UsdgInRange } = await import("../chain/v4/mint.js");
+    const r = isUsd
+      ? await openV4UsdgInRange(v4pool, pending.ethAmt)
+      : inR
+        ? await openV4InRange(pending.token, pending.ethAmt, { fee })
+        : await openV4SingleSide(pending.token, pending.ethAmt, { fee });
     const sym = pending.meta.symbol;
     pending = null;
     await send(
@@ -243,19 +348,60 @@ async function onMintV4(mid: number, mode: "single" | "inrange"): Promise<void> 
   }
 }
 
+async function onMintV2(mid: number): Promise<void> {
+  if (!pending?.chosen?.v2 || !pending.ethAmt) return;
+  await edit(mid, `⏳ <b>LP v2 ${pending.ethAmt} ETH…</b> (wrap → swap ~50% → add liquidity)`);
+  try {
+    const { openV2 } = await import("../chain/v2/mint.js");
+    const r = await openV2(pending.token, pending.ethAmt);
+    const sym = pending.meta.symbol;
+    pending = null;
+    await send(
+      [
+        `✅ <b>${esc(sym)}</b> [v2] 🎯 full-range LP`,
+        r.wrapHash ? `wrap: <a href="${explorerTx(r.wrapHash)}">tx</a>` : "",
+        r.swapHash ? `swap ~50% → ${esc(sym)}: <a href="${explorerTx(r.swapHash)}">tx</a>` : "",
+        `pool fee <b>0.30%</b> · deposit ${r.depositEth}Ξ`,
+        `add-LP: <a href="${explorerTx(r.txHash)}">tx</a>`,
+        `pair <code>${r.pair}</code>`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  } catch (e) {
+    await send(`❌ v2 LP gagal: ${short(e, 160)}`);
+  }
+}
+
 // ══════════ /list ══════════
 
-export async function onList(mid: number | null = null): Promise<void> {
+// cache the assembled /list payload so re-opening or spamming isn't a fresh multi-second on-chain
+// scan each time. Refresh (force) bypasses it; any close/mint invalidates it.
+let listCache: { head: string; body: string; btns: object[]; at: number } | null = null;
+export function invalidateListCache(): void {
+  listCache = null;
+}
+const LIST_TTL_MS = 20_000;
+
+export async function onList(mid: number | null = null, force = false): Promise<void> {
+  if (!force && listCache && Date.now() - listCache.at < LIST_TTL_MS) {
+    const c = listCache;
+    const km = { reply_markup: { inline_keyboard: c.btns } };
+    await (mid ? edit(mid, c.head + "\n" + c.body, km) : send(c.head + "\n" + c.body, km));
+    return;
+  }
   if (!mid) {
     const m = await send("⏳ Memuat posisi…");
     mid = m?.result?.message_id ?? null;
   }
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
   const { listV4Positions } = await import("../chain/v4/list.js");
-  // v3 + v4 in parallel (was sequential → slow "Memuat posisi…")
-  const [rowsRes, v4rows] = await Promise.all([
+  const { listV2Positions } = await import("../chain/v2/list.js");
+  // v2 + v3 + v4 in parallel (was sequential → slow "Memuat posisi…")
+  const [rowsRes, v4rows, v2rows] = await Promise.all([
     listPositions().then((r) => ({ ok: true as const, r })).catch((e) => ({ ok: false as const, e })),
     listV4Positions().catch(() => []),
+    listV2Positions().catch(() => []),
   ]);
   if (!rowsRes.ok) {
     await out(`❌ ${short(rowsRes.e, 80)}`);
@@ -263,8 +409,8 @@ export async function onList(mid: number | null = null): Promise<void> {
   }
   const rows = rowsRes.r;
   const refreshBtn = [{ text: "🔄 Refresh", callback_data: "refresh" }];
-  if (!rows.length && !v4rows.length) {
-    await out("Tidak ada posisi LP terbuka (v3/v4).", { reply_markup: { inline_keyboard: [refreshBtn] } });
+  if (!rows.length && !v4rows.length && !v2rows.length) {
+    await out("Tidak ada posisi LP terbuka (v2/v3/v4).", { reply_markup: { inline_keyboard: [refreshBtn] } });
     return;
   }
   const px = await ethUsd().catch(() => 0);
@@ -281,7 +427,7 @@ export async function onList(mid: number | null = null): Promise<void> {
     const rate = hrs > 0.05 && r.feeEth ? `${usd(r.feeEth / hrs)}/jam` : "—";
     const tag = `${r.inRange ? "🟢 IN RANGE" : "🔴 OUT OF RANGE"}${r.mode === "inrange" ? " · 🎯" : ""}`;
     if (i) T.push("");
-    T.push(`${tokenEmoji(r.tokenSym)} ${r.tokenSym}  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
+    T.push(`${tokenEmoji(r.tokenSym)} ${r.tokenSym}/WETH  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
     T.push(`   ${tag}`);
     T.push("   " + "─".repeat(34));
     T.push(`   ${padR("modal", 7)} ${padL(r.depEth != null ? r.depEth.toFixed(6) + "Ξ" : "—", 11)}  ${padL(r.depEth != null ? usd(r.depEth) : "—", 9)}`);
@@ -297,14 +443,6 @@ export async function onList(mid: number | null = null): Promise<void> {
     }
   });
 
-  const S: string[] = [];
-  S.push(`TOTAL ${rows.length} posisi`);
-  S.push("─".repeat(37));
-  S.push(`${padR("modal", 7)} ${padL(totDep.toFixed(6) + "Ξ", 11)}  ${padL(usd(totDep), 9)}`);
-  S.push(`${padR("nilai", 7)} ${padL(totEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(totEth), 9)}`);
-  S.push(`${padR("fee", 7)} ${padL(totFee.toFixed(6) + "Ξ", 11)}  ${padL(usd(totFee), 9)}`);
-  S.push(`${padR("PnL", 7)} ${padL(sg(totPnl, 6) + "Ξ", 11)}  ${padL((totPnl >= 0 ? "+" : "-") + "$" + Math.abs(totPnl * px).toFixed(2), 9)}`);
-
   const dupe: Record<string, number> = {};
   rows.forEach((r) => (dupe[r.tokenSym] = (dupe[r.tokenSym] || 0) + 1));
   const btns: object[] = [refreshBtn];
@@ -314,7 +452,7 @@ export async function onList(mid: number | null = null): Promise<void> {
         ? ` ${r.pnlEth >= 0 ? "🟩" : "🟥"} ${r.pnlEth >= 0 ? "+" : "-"}$${Math.abs(r.pnlEth * px).toFixed(2)} · ${sg(r.pnlPct ?? 0, 1)}%`
         : "";
     const id = dupe[r.tokenSym]! > 1 ? ` #${r.tokenId}` : "";
-    btns.push([{ text: `${tokenEmoji(r.tokenSym)} Close ${r.tokenSym}${id}${p}`, callback_data: `close:${r.tokenId}` }]);
+    btns.push([{ text: `Close ${r.tokenSym}${id}${p}`, callback_data: `close:${r.tokenId}` }]);
   });
   if (rows.length > 1) btns.push([{ text: `🗑🗑 CLOSE ALL (${rows.length} posisi)`, callback_data: "closeall" }]);
 
@@ -324,6 +462,14 @@ export async function onList(mid: number | null = null): Promise<void> {
     T4.push(`🦄 UNISWAP v4 · ${v4rows.length} posisi`);
     T4.push("─".repeat(37));
     v4rows.forEach((r, i) => {
+      const vEth = px ? r.valueUsd / px : 0;
+      const fEth = px ? r.feeUsd / px : 0;
+      totEth += vEth;
+      totFee += fEth;
+      if (r.depEth != null) {
+        totDep += r.depEth;
+        totPnl += vEth - r.depEth;
+      }
       if (i) T4.push("");
       T4.push(`${tokenEmoji(r.sym)} ${r.pair}  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
       T4.push(`   ${r.inRange ? "🟢 IN RANGE" : "🔴 OUT OF RANGE"}${r.ethPaired ? "" : " · non-ETH pair"}`);
@@ -333,33 +479,87 @@ export async function onList(mid: number | null = null): Promise<void> {
       if (r.depEth != null) T4.push(`   ${padR("modal", 7)} ${r.depEth.toFixed(6)}Ξ (${usd(r.depEth)})`);
       T4.push(`   ${padR("umur", 7)} ${fmtAge(r.ageMs)}`);
     });
+    const dupe4: Record<string, number> = {};
+    v4rows.forEach((r) => (dupe4[r.sym] = (dupe4[r.sym] || 0) + 1));
     for (const r of v4rows) {
-      const feeTag = r.feeUsd > 0.01 ? ` 💵$${r.feeUsd.toFixed(2)}` : "";
-      btns.push([
-        { text: `🧲 Claim fee ${r.sym}${feeTag}`, callback_data: `v4f:${r.tokenId}` },
-        { text: `🦄 Close #${r.tokenId}`, callback_data: `v4c:${r.tokenId}` },
-      ]);
+      const idTag = dupe4[r.sym]! > 1 ? ` #${r.tokenId}` : "";
+      const row: object[] = [];
+      // only offer Claim when there's fee worth claiming
+      if (r.feeUsd > 0.01) row.push({ text: `💰 Claim`, callback_data: `v4f:${r.tokenId}` });
+      row.push({ text: `Close ${r.sym}${idTag}`, callback_data: `v4c:${r.tokenId}` });
+      btns.push(row);
     }
+  }
+
+  // ── v2 positions block ──
+  const T2: string[] = [];
+  if (v2rows.length) {
+    T2.push(`💧 UNISWAP v2 · ${v2rows.length} posisi · fee 0.30%`);
+    T2.push("─".repeat(37));
+    v2rows.forEach((r, i) => {
+      totEth += r.valueEth || 0;
+      if (r.depEth != null) totDep += r.depEth;
+      if (r.pnlEth != null) totPnl += r.pnlEth;
+      if (i) T2.push("");
+      T2.push(`${tokenEmoji(r.sym)} ${r.sym}/WETH  ·  ${r.sharePct.toFixed(3)}% pool`);
+      T2.push(`   ${padR("nilai", 7)} ${padL(r.valueEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.valueEth), 9)}`);
+      T2.push(`   ${padR("isi", 7)} ${r.amountToken} ${r.sym} + ${r.amountWeth} WETH`);
+      if (r.depEth != null) T2.push(`   ${padR("modal", 7)} ${padL(r.depEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.depEth), 9)}`);
+      if (r.pnlEth != null)
+        T2.push(`   ${padR("PnL", 7)} ${padL(sg(r.pnlEth, 6) + "Ξ", 11)}  ${padL((r.pnlEth >= 0 ? "+" : "-") + "$" + Math.abs(r.pnlEth * px).toFixed(2), 9)}  ${sg(r.pnlPct ?? 0, 1)}%`);
+      if (r.ageMs != null) T2.push(`   ${padR("umur", 7)} ${fmtAge(r.ageMs)}`);
+    });
+    for (const r of v2rows) {
+      const p = r.pnlEth != null ? ` ${r.pnlEth >= 0 ? "🟩" : "🟥"}${r.pnlEth >= 0 ? "+" : "-"}$${Math.abs(r.pnlEth * px).toFixed(2)}` : "";
+      btns.push([{ text: `Close ${r.sym}${p}`, callback_data: `v2c:${r.pair}` }]);
+    }
+  }
+
+  // ── unified TOTAL (v3 + v4 + v2), always LAST ──
+  const totalCount = rows.length + v4rows.length + v2rows.length;
+  const S: string[] = [];
+  if (totalCount > 1) {
+    S.push(`TOTAL ${totalCount} posisi  ·  v3 ${rows.length} · v4 ${v4rows.length} · v2 ${v2rows.length}`);
+    S.push("─".repeat(37));
+    S.push(`${padR("modal", 7)} ${padL(totDep.toFixed(6) + "Ξ", 11)}  ${padL(usd(totDep), 9)}`);
+    S.push(`${padR("nilai", 7)} ${padL(totEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(totEth), 9)}`);
+    S.push(`${padR("fee", 7)} ${padL(totFee.toFixed(6) + "Ξ", 11)}  ${padL(usd(totFee), 9)}`);
+    S.push(`${padR("PnL", 7)} ${padL(sg(totPnl, 6) + "Ξ", 11)}  ${padL((totPnl >= 0 ? "+" : "-") + "$" + Math.abs(totPnl * px).toFixed(2), 9)}`);
   }
 
   const jam = new Date().toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const head = `📋 <b>Posisi LP</b>${px ? ` · ETH $${px.toFixed(0)}` : ""} · <i>${jam}</i>`;
   const body =
-    (rows.length ? pre(T.join("\n")) + pre(S.join("\n")) : "") + (T4.length ? pre(T4.join("\n")) : "");
+    (rows.length ? pre(T.join("\n")) : "") +
+    (T4.length ? pre(T4.join("\n")) : "") +
+    (T2.length ? pre(T2.join("\n")) : "") +
+    (S.length ? pre(S.join("\n")) : "");
+  listCache = { head, body, btns, at: Date.now() };
   await out(head + "\n" + body, { reply_markup: { inline_keyboard: btns } });
 }
 
 // ══════════ /ledger ══════════
 
 const LEDGER_PER_PAGE = 5;
+// cache the slow on-chain v4 "closed positions" scan so paginating (Next/Back) is instant
+let ledgerHistCache: { v4hist: Awaited<ReturnType<typeof import("../chain/v4/list.js")["listClosedV4Positions"]>>; at: number } | null = null;
 export async function onLedger(page = 0, mid: number | null = null): Promise<void> {
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
   const { listClosedV4Positions } = await import("../chain/v4/list.js");
-  const v3all = readLedger().slice().sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
-  const v4closed = await listClosedV4Positions().catch(() => [] as Awaited<ReturnType<typeof listClosedV4Positions>>);
+  const allEntries = readLedger(); // unified: v3 + v4 + v2 (forward-tracked closes) — cheap (file)
+  const entryIds = new Set(allEntries.map((e) => e.tokenId));
+  // v4 historical scan (on-chain, per-NFT → slow) is CACHED so Next/Back doesn't refetch each page
+  let v4hist: Awaited<ReturnType<typeof listClosedV4Positions>>;
+  if (ledgerHistCache && Date.now() - ledgerHistCache.at < 45_000) {
+    v4hist = ledgerHistCache.v4hist.filter((c) => !entryIds.has(c.tokenId));
+  } else {
+    const v4closedRaw = await listClosedV4Positions().catch(() => [] as Awaited<ReturnType<typeof listClosedV4Positions>>);
+    ledgerHistCache = { v4hist: v4closedRaw, at: Date.now() };
+    v4hist = v4closedRaw.filter((c) => !entryIds.has(c.tokenId));
+  }
   const sum = ledgerSummary();
 
-  if (!v3all.length && !v4closed.length) {
+  if (!allEntries.length && !v4hist.length) {
     await out("⏳ <b>Ledger kosong — rebuild dari on-chain…</b>");
     try {
       await backfillLedger();
@@ -374,40 +574,58 @@ export async function onLedger(page = 0, mid: number | null = null): Promise<voi
     return onLedger(page, mid);
   }
 
-  // unified closed list: v3 (rich PnL) + v4 (pair only), one paginated stream
-  type LedRow = { v3?: (typeof v3all)[number]; v4?: (typeof v4closed)[number] };
-  const combined: LedRow[] = [...v3all.map((e) => ({ v3: e })), ...v4closed.map((c) => ({ v4: c }))];
+  // unified closed list, RECENT FIRST (v3 + v4 + v2 entries interleaved by close time;
+  // v4 positions closed before tracking shown last with PnL unavailable)
+  type LedRow = { e?: (typeof allEntries)[number]; v4h?: (typeof v4hist)[number]; ts: number };
+  const combined: LedRow[] = [
+    ...allEntries.map((e) => ({ e, ts: e.closedAt ?? 0 })),
+    ...v4hist.map((c) => ({ v4h: c, ts: c.closedAt ?? 0 })),
+  ].sort((a, b) => b.ts - a.ts);
   const pages = Math.max(1, Math.ceil(combined.length / LEDGER_PER_PAGE));
   page = Math.min(Math.max(0, page), pages - 1);
   const slice = combined.slice(page * LEDGER_PER_PAGE, page * LEDGER_PER_PAGE + LEDGER_PER_PAGE);
   const px = await ethUsd().catch(() => 0);
   const when = (ts: number | null) =>
     ts ? new Date(ts).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "?";
+  const verTag = (v?: string) => (v === "v4" ? "v4 🦄" : v === "v2" ? "v2 💧" : "v3");
 
   const T: string[] = [];
   slice.forEach((row, i) => {
     const n = page * LEDGER_PER_PAGE + i + 1;
     if (i) T.push("");
-    if (row.v3) {
-      const e = row.v3;
+    if (row.e) {
+      const e = row.e;
+      const name = e.pair ?? `${e.sym}/WETH`; // v3 has no pair field → it's always token/WETH
       const win = e.pnlEth == null ? "⬜" : e.pnlEth >= 0 ? "🟩" : "🟥";
-      T.push(`${win} ${tokenEmoji(e.sym)} ${e.sym} · v3${e.mode === "inrange" ? " 🎯" : ""}   ${n}/${combined.length}`);
+      T.push(`${win} ${tokenEmoji(e.sym)} ${name} · ${verTag(e.version)}${e.mode === "inrange" ? " 🎯" : ""}   ${n}/${combined.length}`);
       T.push(`   ${when(e.closedAt)} · hold ${fmtAge(e.heldMs)}`);
-      T.push(`   modal ${(e.depEth ?? 0).toFixed(5)}Ξ → balik ${(e.outEth ?? 0).toFixed(5)}Ξ`);
-      if (e.pnlEth != null) T.push(`   PnL ${sg(e.pnlEth, 5)}Ξ  ${e.pnlUsd != null ? money(e.pnlUsd) : "—"}  ${sg(e.pnlPct ?? 0, 1)}%`);
-      else T.push(`   PnL — (modal tak tercatat)`);
+      if (e.quote === "usd") {
+        // USDG-paired pools → show USD (natural unit); ETH shown as secondary
+        const at = e.ethUsdAtClose || px || 0;
+        const $ = (eth: number) => "$" + (eth * at).toFixed(2);
+        T.push(`   modal ${$(e.depEth ?? 0)} → balik ${$(e.outEth ?? 0)}`);
+        if (e.pnlEth != null) T.push(`   PnL ${e.pnlUsd != null ? money(e.pnlUsd) : $(e.pnlEth)}  (${sg(e.pnlEth, 5)}Ξ)  ${sg(e.pnlPct ?? 0, 1)}%`);
+        else T.push(`   PnL — (modal tak tercatat)`);
+      } else {
+        T.push(`   modal ${(e.depEth ?? 0).toFixed(5)}Ξ → balik ${(e.outEth ?? 0).toFixed(5)}Ξ`);
+        if (e.pnlEth != null) T.push(`   PnL ${sg(e.pnlEth, 5)}Ξ  ${e.pnlUsd != null ? money(e.pnlUsd) : "—"}  ${sg(e.pnlPct ?? 0, 1)}%`);
+        else T.push(`   PnL — (modal tak tercatat)`);
+      }
       if ((e.unsoldEth ?? 0) > 0) T.push(`   🪙 nyangkut ~${(e.unsoldEth ?? 0).toFixed(5)}Ξ (blm dijual)`);
-    } else if (row.v4) {
-      const c = row.v4;
+    } else if (row.v4h) {
+      const c = row.v4h;
       T.push(`⬜ ${tokenEmoji(c.pair)} ${c.pair} · v4 🦄   ${n}/${combined.length}`);
-      T.push(`   fee ${(c.fee / 10000).toFixed(2)}% · #${c.tokenId}`);
-      T.push(`   PnL — (v4 historis)${c.depEth != null ? ` · modal ${c.depEth.toFixed(5)}Ξ` : ""}`);
+      T.push(`   ${when(c.closedAt)} · #${c.tokenId} · fee ${(c.fee / 10000).toFixed(2)}%`);
+      T.push(`   PnL — (histori sblm tracking${c.depEth != null ? `, modal ${c.depEth.toFixed(5)}Ξ` : ""})`);
     }
   });
 
+  const nV3 = allEntries.filter((e) => (e.version ?? "v3") === "v3").length;
+  const nV4 = allEntries.filter((e) => e.version === "v4").length + v4hist.length;
+  const nV2 = allEntries.filter((e) => e.version === "v2").length;
   const net = sum.pnlEth + sum.unsoldEth;
   const S: string[] = [];
-  S.push(`${combined.length} DITUTUP · ${v3all.length} v3 · ${v4closed.length} v4`);
+  S.push(`${combined.length} DITUTUP · ${nV3} v3 · ${nV4} v4${nV2 ? ` · ${nV2} v2` : ""}`);
   S.push("─".repeat(34));
   S.push(`${padR("menang", 9)} ${sum.wins}W / ${sum.losses}L · ${sum.winRate.toFixed(0)}%`);
   S.push(`${padR("modal", 9)} ${sum.depEth.toFixed(5)}Ξ · fee ${sum.feeEth.toFixed(5)}Ξ`);
@@ -421,18 +639,38 @@ export async function onLedger(page = 0, mid: number | null = null): Promise<voi
   if (page < pages - 1) nav.push({ text: "Next ▶️", callback_data: `lg:${page + 1}` });
 
   const head = `📒 <b>Ledger LP</b> · ${combined.length} posisi ditutup`;
-  const foot = v4closed.length ? `<i>Stats di atas = v3. PnL historis v4 belum direkonstruksi.</i>` : "";
+  const foot = v4hist.length
+    ? `<i>Stats gabung v3+v4+v2. ${v4hist.length} posisi v4 LAMA blm direkonstruksi — tap 🔄 Rebuild.</i>`
+    : "";
+  // 📸 card button per closed position on this page (positions with recorded PnL)
+  const cardBtns: object[] = [];
+  slice.forEach((row) => {
+    if (row.e && row.e.pnlEth != null) {
+      const e = row.e;
+      const p = e.pnlEth! >= 0 ? "🟩" : "🟥";
+      cardBtns.push([{ text: `📸 ${tokenEmoji(e.sym)} ${e.pair ?? `${e.sym}/WETH`} ${p}`, callback_data: `cardp:${e.tokenId}` }]);
+    }
+  });
   await out(head + "\n" + pre(T.join("\n")) + pre(S.join("\n")) + foot, {
-    reply_markup: { inline_keyboard: [nav, [{ text: "🔄 Rebuild dari on-chain", callback_data: "lgrb" }]] },
+    reply_markup: {
+      inline_keyboard: [
+        nav,
+        ...cardBtns,
+        [{ text: "📸 Kartu portfolio", callback_data: "card" }, { text: "🔄 Rebuild on-chain", callback_data: "lgrb" }],
+      ],
+    },
   });
 }
 
 export async function onLedgerRebuild(mid: number): Promise<void> {
+  ledgerHistCache = null; // force a fresh on-chain scan
   try {
-    const r = await backfillLedger((msg) => {
-      void edit(mid, `⏳ <b>Rebuild ledger dari on-chain</b>\n<i>${esc(msg)}</i>`).catch(() => {});
-    });
-    await edit(mid, `✅ Rebuild selesai — ${r.rebuilt} posisi dari on-chain, total ${r.total}.`);
+    const prog = (msg: string) => void edit(mid, `⏳ <b>Rebuild ledger dari on-chain</b>\n<i>${esc(msg)}</i>`).catch(() => {});
+    const r = await backfillLedger(prog);
+    // v4 positions closed before tracking → reconstruct realized PnL from archive (historical price)
+    const { backfillLedgerV4 } = await import("../chain/v4/backfill.js");
+    const r4 = await backfillLedgerV4(prog).catch(() => ({ rebuilt: 0 }));
+    await edit(mid, `✅ Rebuild selesai — v3: ${r.rebuilt} · v4: ${r4.rebuilt} direkonstruksi dari on-chain.`);
     await onLedger(0);
   } catch (e) {
     await edit(mid, `❌ Rebuild gagal: ${short(e, 100)}`);
@@ -440,6 +678,49 @@ export async function onLedgerRebuild(mid: number): Promise<void> {
 }
 
 // ══════════ /scan (manual) ══════════
+
+// ══════════ /screen (GMGN 24h thesis screen) ══════════
+
+export async function onScreen(arg?: string): Promise<void> {
+  const useLlm = arg !== "fast" && !!env.openrouterKey;
+  const m = await send(`🧪 <b>Screening GMGN 24h…</b> <i>(mcap&gt;$500k · vol&gt;$1M · no flap${useLlm ? " · +thesis LLM" : ""})</i>`);
+  const mid = m?.result?.message_id;
+  try {
+    const { screenTokens } = await import("../radar/screen.js");
+    const { results, scanned, excludedFlap, excludedUnsafe } = await screenTokens({ llm: useLlm });
+    if (!scanned) {
+      await edit(mid, "🧪 GMGN nggak balikin data trending (CLI belum aktif / rate-limit). Coba lagi.");
+      return;
+    }
+    if (!results.length) {
+      await edit(mid, `🧪 Nggak ada token lolos filter.\n<i>scan ${scanned} · buang ${excludedFlap} flap · ${excludedUnsafe} unsafe</i>`);
+      return;
+    }
+    const kindTag = (k: string) => (k === "util" ? "🛠 util" : k === "meme" ? "🐸 meme" : "❓ unclear");
+    const commTag = (c: string) => (c === "clear" ? "🟢 komun jelas" : c === "thin" ? "🟡 komun tipis" : "🔴 komun sus");
+    const T: string[] = [];
+    results.forEach((r, i) => {
+      const t = r.token;
+      if (i) T.push("");
+      T.push(`${i + 1}. ${tokenEmoji(t.symbol)} ${t.symbol}  ·  ${kindTag(r.kind)}  ·  skor ${r.score}${r.verdict ? " · " + r.verdict.toUpperCase() : ""}`);
+      T.push(`   ${commTag(r.community)} · FOMO ${r.fomo}`);
+      T.push(`   mcap ${fmtMcap(t.marketCap)} · vol ${fmtMcap(t.volume)} · liq ${fmtMcap(t.liquidity)}`);
+      const turn = t.liquidity > 0 ? (t.volume / t.liquidity).toFixed(0) + "×" : "?";
+      T.push(`   turn ${turn} · 24h ${sg(t.change24hPct, 0)}% · smart ${t.smartWallets} · KOL ${t.kolWallets} · hold ${t.holders}`);
+      if (r.thesis) T.push(`   💡 ${r.thesis}`);
+      if (r.flags.length) T.push(`   🚩 ${r.flags.join(" · ")}`);
+    });
+    const head = `🧪 <b>Screen GMGN 24h</b> — ${results.length} kandidat\n<i>scan ${scanned} · buang ${excludedFlap} flap · ${excludedUnsafe} unsafe</i>`;
+    // LP shortcut buttons for the top 6
+    const btns = results.slice(0, 6).map((r) => [
+      { text: `${tokenEmoji(r.token.symbol)} LP ${r.token.symbol} (${r.score})`, callback_data: `ca:${r.token.address}` },
+    ]);
+    btns.push([{ text: "🔄 Refresh", callback_data: "screen" }]);
+    await edit(mid, head + "\n" + pre(T.join("\n")), { reply_markup: { inline_keyboard: btns } });
+  } catch (e) {
+    await edit(mid, `❌ Screen gagal: ${short(e, 120)}`);
+  }
+}
 
 export async function onScan(): Promise<void> {
   const { scanOnce } = await import("../watch/scanner.js");
@@ -619,6 +900,7 @@ export async function onV4Lp(text: string): Promise<void> {
 }
 
 export async function onV4Close(text: string): Promise<void> {
+  invalidateListCache();
   const [, tokenId] = text.split(/\s+/);
   if (!tokenId || !/^\d+$/.test(tokenId)) {
     await send("Format: <code>/v4close &lt;tokenId&gt;</code>");
@@ -632,13 +914,17 @@ export async function onV4Close(text: string): Promise<void> {
     await edit(
       mid,
       [
-        `✅ <b>v4 #${tokenId} closed</b> · fee ${(r.fee / 10000).toFixed(2)}%`,
+        `✅ <b>v4 #${tokenId} closed</b> · pool fee ${(r.fee / 10000).toFixed(2)}%`,
         `Balik: ${r.recv0 > 0 ? `${r.recv0.toFixed(6)} ${r.sym0}` : ""}${r.recv0 > 0 && r.recv1 > 0 ? " + " : ""}${r.recv1 > 0 ? `${r.recv1.toFixed(6)} ${r.sym1}` : ""}`,
+        r.feeEth > 0 ? `🧲 fee earned: <b>${r.feeEth.toFixed(6)}Ξ</b>` : "",
+        r.forfeited ? `⚠️ <b>${esc(r.forfeited)}</b> nggak bisa ditarik (honeypot/rug) — direlakan, ETH diselamatkan.` : "",
         `tx: <a href="${explorerTx(r.txHash)}">tx</a>`,
       ]
         .filter(Boolean)
         .join("\n"),
     );
+    const v4quote = /usdg|usd/i.test(r.pair) && !/\beth\b|weth/i.test(r.pair) ? ("usd" as const) : ("eth" as const);
+    await sendCloseCard({ name: r.pair, version: "v4", quote: v4quote, depEth: r.depEth, outEth: r.outEth, feeEth: r.feeEth, pnlEth: r.pnlEth, pnlPct: r.pnlPct });
   } catch (e) {
     await edit(mid, `❌ v4 close gagal: ${short(e, 160)}`);
   }
@@ -661,6 +947,34 @@ export async function onV4Collect(tokenId: string): Promise<void> {
     );
   } catch (e) {
     await edit(mid, `❌ Claim fee gagal: ${short(e, 160)}`);
+  }
+}
+
+export async function onV2Close(pair: string): Promise<void> {
+  invalidateListCache();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(pair)) {
+    await send("Format: <code>/v2close &lt;pairAddress&gt;</code>");
+    return;
+  }
+  const m = await send(`⏳ Closing v2 ${pair.slice(0, 10)}…`);
+  const mid = m?.result?.message_id;
+  try {
+    const { closeV2Position } = await import("../chain/v2/close.js");
+    const r = await closeV2Position(pair);
+    await edit(
+      mid,
+      [
+        `✅ <b>v2 ${esc(r.sym)}/WETH closed</b>`,
+        `Balik: <b>${r.recvEth.toFixed(6)} ETH</b>${r.soldToken ? " (token dijual balik)" : r.recvToken > 0 ? ` + ${r.recvToken.toPrecision(6)} ${esc(r.sym)}` : ""}`,
+        r.pnlEth != null ? `PnL: ${r.pnlEth >= 0 ? "🟩 +" : "🟥 "}${r.pnlEth.toFixed(6)}Ξ` : "",
+        `burn: <a href="${explorerTx(r.txHash)}">tx</a>${r.swapHash ? ` · sell: <a href="${explorerTx(r.swapHash)}">tx</a>` : ""}`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    await sendCloseCard({ name: `${r.sym}/WETH`, version: "v2", depEth: r.depEth, outEth: r.recvEth, pnlEth: r.pnlEth });
+  } catch (e) {
+    await edit(mid, `❌ v2 close gagal: ${short(e, 160)}`);
   }
 }
 
@@ -731,6 +1045,7 @@ export async function onCloseAsk(tokenId: string, mid: number): Promise<void> {
 }
 
 export async function onClose(tokenId: string, mid: number, swapToken = true): Promise<void> {
+  invalidateListCache();
   await edit(mid, `⏳ Closing #${tokenId}… ${swapToken ? "(swap token→ETH)" : "(simpen token)"}`);
   try {
     const r = await closePosition(tokenId, { swapToken });
@@ -758,12 +1073,14 @@ export async function onClose(tokenId: string, mid: number, swapToken = true): P
         .filter(Boolean)
         .join("\n"),
     );
+    await sendCloseCard({ name: `${r.tokenSym}/WETH`, version: "v3", depEth: r.depEth, outEth: r.valEth, pnlEth: r.pnlEth, pnlPct: r.pnlPct, heldMs: r.heldMs });
   } catch (e) {
     await send(`❌ Close gagal: ${short(e, 120)}`);
   }
 }
 
 export async function onCloseAll(): Promise<void> {
+  invalidateListCache();
   let rows;
   try {
     rows = await listPositions();
@@ -800,9 +1117,194 @@ export async function onCloseAll(): Promise<void> {
       .filter(Boolean)
       .join("\n"),
   );
+  if (ok > 0) await onCard(); // flex the portfolio result
 }
 
-// ══════════ misc ══════════
+// ══════════ 🔄 swap (KyberSwap aggregator) ══════════
+
+let pendingSwap: { fromAddr: string; toAddr: string; amountIn: bigint; fromSym: string; toSym: string; toDec: number } | null = null;
+
+export async function onSwap(text: string): Promise<void> {
+  const { kyberEnabled, kyberRoute, routeBreakdown, KYBER_NATIVE } = await import("../chain/kyber.js");
+  if (!kyberEnabled()) {
+    await send("🔄 Swap butuh KyberSwap — <code>KYBERSWAP_ROUTER_ADDRESS</code> belum diset di .env.");
+    return;
+  }
+  const parts = text.trim().split(/\s+/);
+  if (parts.length < 4) {
+    await sendMenu(
+      [
+        "🔄 <b>Swap via KyberSwap</b> (rute terbaik otomatis)",
+        "Format: <code>/swap &lt;jumlah&gt; &lt;dari&gt; &lt;ke&gt;</code>",
+        "",
+        "• <code>/swap 0.01 eth 0xCA</code> — ETH → token",
+        "• <code>/swap 100 0xCA eth</code> — token → ETH",
+        "• <code>/swap 50 0xTokenA 0xTokenB</code> — token → token",
+        "",
+        "<i>dari/ke: ketik <b>eth</b> atau alamat kontrak (0x… 40 hex)</i>",
+      ].join("\n"),
+    );
+    return;
+  }
+  const [, amtStr, fromS, toS] = parts as [string, string, string, string];
+  const resolve = (s: string) => (/^eth$/i.test(s) ? KYBER_NATIVE : /^0x[0-9a-fA-F]{40}$/.test(s) ? ethers.getAddress(s) : null);
+  const fromAddr = resolve(fromS);
+  const toAddr = resolve(toS);
+  if (!fromAddr || !toAddr) {
+    await send("Dari/ke harus <b>eth</b> atau alamat kontrak (0x… 40 hex).");
+    return;
+  }
+  if (fromAddr.toLowerCase() === toAddr.toLowerCase()) {
+    await send("Dari & ke sama — nggak ada yang di-swap.");
+    return;
+  }
+  if (!(parseFloat(amtStr) > 0)) {
+    await send("Jumlah nggak valid, contoh: <code>0.01</code>");
+    return;
+  }
+  const nativeIn = fromAddr.toLowerCase() === KYBER_NATIVE.toLowerCase();
+  const nativeOut = toAddr.toLowerCase() === KYBER_NATIVE.toLowerCase();
+  const fromMeta = nativeIn ? { decimals: 18, symbol: "ETH" } : await tokenMeta(fromAddr).catch(() => ({ decimals: 18, symbol: "?" }));
+  const toMeta = nativeOut ? { decimals: 18, symbol: "ETH" } : await tokenMeta(toAddr).catch(() => ({ decimals: 18, symbol: "?" }));
+  let amountIn: bigint;
+  try {
+    amountIn = ethers.parseUnits(amtStr, fromMeta.decimals);
+  } catch {
+    await send("Format jumlah salah.");
+    return;
+  }
+
+  const m = await send("🔄 Cari rute Kyber…");
+  const mid = m?.result?.message_id;
+  const route = await kyberRoute(fromAddr, toAddr, amountIn).catch(() => null);
+  if (!route) {
+    await edit(mid, "❌ Kyber nggak nemu rute buat pair ini (likuiditas kering?).");
+    return;
+  }
+  const outRaw = BigInt(route.routeSummary.amountOut);
+  const outUi = Number(ethers.formatUnits(outRaw, toMeta.decimals));
+  const usd = route.routeSummary.amountOutUsd ? ` <i>($${Number(route.routeSummary.amountOutUsd).toFixed(2)})</i>` : "";
+  pendingSwap = { fromAddr, toAddr, amountIn, fromSym: fromMeta.symbol, toSym: toMeta.symbol, toDec: toMeta.decimals };
+  await edit(
+    mid,
+    [
+      `🔄 <b>Swap ${esc(amtStr)} ${esc(fromMeta.symbol)} → ~${outUi.toPrecision(6)} ${esc(toMeta.symbol)}</b>${usd}`,
+      `rute: <i>${esc(routeBreakdown(route.routeSummary) || "kyber")}</i> · slippage ${cfg.lp.slippagePct}%`,
+    ].join("\n"),
+    { reply_markup: { inline_keyboard: [[{ text: "✅ Swap", callback_data: "swapdo" }, { text: "❌ Cancel", callback_data: "cancel" }]] } },
+  );
+}
+
+export async function onSwapDo(mid: number): Promise<void> {
+  if (!pendingSwap) return;
+  const s = pendingSwap;
+  pendingSwap = null;
+  await edit(mid, `⏳ Swap ${esc(s.fromSym)} → ${esc(s.toSym)}…`);
+  try {
+    const { kyberSwap } = await import("../chain/kyber.js");
+    const r = await kyberSwap(s.fromAddr, s.toAddr, s.amountIn);
+    if (!r || r.amountOut <= 0n) {
+      await edit(mid, "❌ Swap gagal / output 0.");
+      return;
+    }
+    await edit(
+      mid,
+      `✅ <b>Swap sukses</b> → +${Number(ethers.formatUnits(r.amountOut, s.toDec)).toPrecision(6)} ${esc(s.toSym)}\ntx: <a href="${explorerTx(r.tx)}">tx</a>`,
+    );
+  } catch (e) {
+    await edit(mid, `❌ Swap gagal: ${short(e, 150)}`);
+  }
+}
+
+// ══════════ 📸 profit card ══════════
+
+/** Generate + send the whole-portfolio profit card (Meteora-style flex graphic). */
+export async function onCard(): Promise<void> {
+  const m = await send("📸 Bikin kartu profit…");
+  const mid = m?.result?.message_id;
+  try {
+    const { renderCard, portfolioCardData } = await import("./card.js");
+    const png = await renderCard(await portfolioCardData());
+    await sendPhoto(png, "📊 <b>Profit Robinhood LP Bot</b> — share it 🚀");
+    if (mid) await edit(mid, "📸 Kartu profit ↑");
+  } catch (e) {
+    if (mid) await edit(mid, `❌ Gagal bikin kartu: ${short(e, 100)}`);
+  }
+}
+
+/** Save a photo the owner sent as the profit-card background (assets/card-bg.jpg). */
+export async function onSetBg(fileId: string): Promise<void> {
+  const m = await send("🖼 Nyimpen background kartu…");
+  const mid = m?.result?.message_id;
+  try {
+    const buf = await downloadTgFile(fileId);
+    if (!buf) {
+      if (mid) await edit(mid, "❌ Gagal ambil gambar dari Telegram.");
+      return;
+    }
+    mkdirSync("assets", { recursive: true });
+    writeFileSync("assets/card-bg.jpg", buf);
+    if (mid) await edit(mid, "✅ Background kartu di-set. Ini preview-nya 👇");
+    const { renderCard, portfolioCardData } = await import("./card.js");
+    const png = await renderCard(await portfolioCardData());
+    await sendPhoto(png, "🎴 Background baru kepasang — <b>/card</b> kapan aja buat share.");
+  } catch (e) {
+    if (mid) await edit(mid, `❌ Gagal set background: ${short(e, 100)}`);
+  }
+}
+
+/** Print a profit card for an ALREADY-closed position (from a ledger entry, by tokenId). */
+export async function onCardFor(tokenId: string): Promise<void> {
+  const e = readLedger().find((x) => x.tokenId === tokenId);
+  if (!e) {
+    await send("❌ Posisi nggak ketemu di ledger.");
+    return;
+  }
+  const m = await send("📸 Bikin kartu posisi…");
+  const mid = m?.result?.message_id;
+  try {
+    const { renderCard, closeCardData } = await import("./card.js");
+    const png = await renderCard(
+      await closeCardData({
+        name: e.pair ?? `${e.sym}/WETH`,
+        version: (e.version ?? "v3") as "v2" | "v3" | "v4",
+        quote: e.quote,
+        depEth: e.depEth ?? null,
+        outEth: e.outEth ?? 0,
+        pnlEth: e.pnlEth,
+        pnlPct: e.pnlPct,
+        feeEth: e.feeEth,
+        heldMs: e.heldMs,
+        ethUsd: e.ethUsdAtClose ?? undefined,
+      }),
+    );
+    await sendPhoto(png, `🎴 <b>${esc(e.pair ?? `${e.sym}/WETH`)}</b> — share it 🚀`);
+    if (mid) await edit(mid, "📸 Kartu ↑");
+  } catch (err) {
+    if (mid) await edit(mid, `❌ Gagal bikin kartu: ${short(err, 100)}`);
+  }
+}
+
+/** Fire-and-forget a per-close card (never blocks / breaks the close flow). */
+async function sendCloseCard(p: {
+  name: string;
+  version: "v2" | "v3" | "v4";
+  quote?: "eth" | "usd";
+  depEth: number | null;
+  outEth: number;
+  pnlEth: number | null;
+  pnlPct?: number | null;
+  feeEth?: number;
+  heldMs?: number | null;
+}): Promise<void> {
+  try {
+    const { renderCard, closeCardData } = await import("./card.js");
+    const png = await renderCard(await closeCardData(p));
+    await sendPhoto(png);
+  } catch {
+    /* card is a nice-to-have — never let it break a close */
+  }
+}
 
 export async function onPnl(): Promise<void> {
   await send("📊 Menghitung PnL seumur hidup… (scan history + rug, ±20 detik)");
@@ -813,23 +1315,37 @@ export async function onPnl(): Promise<void> {
     await send(`❌ ${short(e, 90)}`);
     return;
   }
-  const u = (e: number) => (r.px ? `$${(e * r.px).toFixed(2)}` : "?");
-  const emo = r.pnlEth > 0 ? "🟢" : r.pnlEth < 0 ? "🔴" : "⚪";
+  const px = r.px;
+  const $ = (e: number) => (px ? "$" + (e * px).toFixed(2) : "?");
+  // ACCURATE LP number from the ledger (closed positions). The wallet capital-flow below is
+  // wallet-level and — because this wallet is shared with the arb bot — mixes in non-LP flows.
+  const sum = ledgerSummary();
+  const row = (lbl: string, eth: string, usd = "") => `${padR(lbl, 8)}${padL(eth, 12)}${usd ? "  " + padL(usd, 9) : ""}`;
+
+  const T: string[] = [];
+  T.push(`LP REALIZED · ${sum.count} ditutup`);
+  T.push("─".repeat(31));
+  T.push(row("PnL", sg(sum.pnlEth, 5) + "Ξ", money(sum.pnlUsd)));
+  T.push(row("menang", `${sum.winRate.toFixed(0)}% (${sum.wins}/${sum.losses})`));
+  T.push(row("fee", sum.feeEth.toFixed(5) + "Ξ"));
+  T.push("");
+  T.push(`ARUS WALLET (+arb)`);
+  T.push("─".repeat(31));
+  T.push(row("setor", r.capIn.toFixed(5) + "Ξ", $(r.capIn)));
+  T.push(row("tarik", r.capOut.toFixed(5) + "Ξ", $(r.capOut)));
+  T.push(row("nilai", r.valueNowEth.toFixed(5) + "Ξ", $(r.valueNowEth)));
+  T.push(`  native ${r.nativeEth.toFixed(4)}  WETH ${r.wethHeld.toFixed(4)}`);
+  T.push(`  LP ${r.openLpEth.toFixed(4)}Ξ  token $${r.tokensUsd.toFixed(2)}`);
+  T.push(row("net", sg(r.pnlEth, 5) + "Ξ", money(r.pnlUsd)));
+
+  const grave = r.graveyardCount
+    ? `\n🪦 <b>${r.graveyardCount} token nyangkut</b> <i>(rug/likuiditas kering)</i>\n${pre(r.graveyard.join(", ") + (r.graveyardCount > r.graveyard.length ? " …" : ""))}`
+    : "";
   await sendMenu(
-    [
-      `📊 <b>PnL SEUMUR HIDUP</b>${r.px ? ` · ETH $${r.px.toFixed(0)}` : ""}`,
-      ``,
-      `💵 Modal disetor : <b>${r.capIn.toFixed(5)}Ξ</b> (${u(r.capIn)})`,
-      r.capOut > 0 ? `↩️ Ditarik keluar: ${r.capOut.toFixed(5)}Ξ (${u(r.capOut)})` : "",
-      `💰 Nilai sekarang: <b>${r.valueNowEth.toFixed(5)}Ξ</b> (${u(r.valueNowEth)})`,
-      `   • native ${r.nativeEth.toFixed(4)}Ξ · WETH ${r.wethHeld.toFixed(4)}Ξ`,
-      `   • LP terbuka ${r.openLpEth.toFixed(4)}Ξ · token $${r.tokensUsd.toFixed(2)}`,
-      `━━━━━━━━━`,
-      `${emo} <b>NET PnL: ${r.pnlEth >= 0 ? "+" : ""}${r.pnlEth.toFixed(5)}Ξ (${r.pnlEth >= 0 ? "+" : "-"}$${Math.abs(r.pnlUsd).toFixed(2)})</b>`,
-      r.graveyardCount ? `\n🪦 <b>${r.graveyardCount} token rug</b> nyangkut worth ~$0:\n<i>${r.graveyard.join(", ")}${r.graveyardCount > 12 ? "…" : ""}</i>` : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
+    `📊 <b>PnL SEUMUR HIDUP</b>${px ? ` · ETH $${px.toFixed(0)}` : ""}\n` +
+      pre(T.join("\n")) +
+      `<i>⚠️ Net wallet nyampur flow arb — angka LP akurat = "LP realized".</i>` +
+      grave,
   );
 }
 
@@ -969,15 +1485,17 @@ export async function onSet(text: string): Promise<void> {
 
 export async function onHelp(): Promise<void> {
   const body = [
-    `🤖 <b>Robinhood LP Bot</b>  <i>v2 · Uniswap v3+v4</i>`,
-    `Paste <b>CA token</b> (0x…) → pilih pool (v3/v4) → jumlah ETH → LP.`,
+    `🤖 <b>Robinhood LP Bot</b>  <i>v2 · Uniswap v2+v3+v4</i>`,
+    `Paste <b>CA token</b> (0x…) → pilih pool (v2/v3/v4) → jumlah ETH → LP.`,
     ``,
     `<b>━━━ 📊 POSISI ━━━</b>`,
     `📋 /list — posisi terbuka + PnL + close`,
     `📒 /ledger — riwayat ditutup (realized)`,
     `💰 /pnl — PnL seumur hidup`,
+    `📸 /card — kartu profit shareable`,
     ``,
     `<b>━━━ 🎯 RADAR & AUTO ━━━</b>`,
+    `🧪 /screen — screening GMGN 24h (mcap&gt;500k, vol&gt;1M, no flap, util&gt;meme)`,
     `📡 /feed — monitor sequencer real-time`,
     `👁 /watch — scanner volume nanjak`,
     `🔍 /scan — cek volume sekarang`,
@@ -985,6 +1503,7 @@ export async function onHelp(): Promise<void> {
     `🦄 /v4 <code>&lt;ca&gt;</code> — cek pool v4 fee-tinggi`,
     ``,
     `<b>━━━ ⚡ AKSI ━━━</b>`,
+    `🔄 /swap <code>&lt;jml&gt; &lt;dari&gt; &lt;ke&gt;</code> — swap via Kyber`,
     `🗑 /closeall · 💸 /sell · 👛 /wallet`,
     `⚙️ /settings · /set <code>&lt;k&gt; &lt;v&gt;</code>`,
     ``,
@@ -997,6 +1516,7 @@ export async function onHelp(): Promise<void> {
 export const isAwaitingAmount = (): boolean => !!pending?.awaitingAmount;
 export const cancelPending = (): void => {
   pending = null;
+  pendingSwap = null;
 };
 
 function short(e: unknown, n: number): string {

@@ -87,6 +87,40 @@ export function edit(messageId: number, text: string, extra: Extra = {}): Promis
   });
 }
 
+/** Send a PNG photo (profit card) to the owner chat via multipart upload. */
+export async function sendPhoto(png: Buffer, caption?: string, extra: Extra = {}): Promise<any> {
+  if (!owner) return null;
+  try {
+    const fd = new FormData();
+    fd.append("chat_id", String(owner));
+    if (caption) {
+      fd.append("caption", caption);
+      fd.append("parse_mode", "HTML");
+    }
+    fd.append("photo", new Blob([new Uint8Array(png)], { type: "image/png" }), "profit.png");
+    for (const [k, v] of Object.entries(extra)) fd.append(k, typeof v === "string" ? v : JSON.stringify(v));
+    const r = await fetch(`${BASE}/sendPhoto`, { method: "POST", body: fd, signal: AbortSignal.timeout(45_000) });
+    return await r.json();
+  } catch (e) {
+    log.warn(`sendPhoto gagal: ${(e as Error).message.slice(0, 80)}`);
+    return null;
+  }
+}
+
+/** Download a Telegram file (by file_id) to a Buffer, or null on failure. */
+export async function downloadTgFile(fileId: string): Promise<Buffer | null> {
+  try {
+    const info = await call("getFile", { file_id: fileId });
+    const fp = info?.result?.file_path;
+    if (!fp) return null;
+    const r = await fetch(`https://api.telegram.org/file/bot${env.tgToken}/${fp}`, { signal: AbortSignal.timeout(30_000) });
+    return Buffer.from(await r.arrayBuffer());
+  } catch (e) {
+    log.warn(`downloadTgFile gagal: ${(e as Error).message.slice(0, 80)}`);
+    return null;
+  }
+}
+
 export function answerCallback(id: string, opts: Extra = {}): Promise<any> {
   return call("answerCallbackQuery", { callback_query_id: id, ...opts });
 }

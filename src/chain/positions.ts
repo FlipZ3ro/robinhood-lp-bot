@@ -308,13 +308,18 @@ export async function listPositions(): Promise<PositionRow[]> {
   const factory = new ethers.Contract(C.factory, FACTORY_ABI, provider);
   const n = Number(await npm.balanceOf!(w.address).catch(() => 0n));
   const px = await ethUsd().catch(() => 0);
-  const rows: PositionRow[] = [];
+  const { mapLimit } = await import("./blockscout.js");
 
-  for (let i = 0; i < n; i++) {
-    try {
-      const id: bigint = await npm.tokenOfOwnerByIndex!(w.address, i);
-      const p = await npm.positions!(id);
-      if (p.liquidity === 0n) continue;
+  // Process every NFT index in PARALLEL (was a sequential for-loop → ~8 RPC round-trips per
+  // position, one at a time; with many closed NFTs it dominated /list latency). ethers batches
+  // the concurrent JSON-RPC calls, so this collapses to a handful of HTTP requests.
+  const idxs = Array.from({ length: n }, (_, i) => i);
+  const rows = (
+    await mapLimit(idxs, 8, async (i): Promise<PositionRow | null> => {
+      try {
+        const id: bigint = await npm.tokenOfOwnerByIndex!(w.address, i);
+        const p = await npm.positions!(id);
+        if (p.liquidity === 0n) return null;
       const pool: string = await factory.getPool!(p.token0, p.token1, p.fee);
       const st = await getPoolState(pool);
       const tl = Number(p.tickLower);
@@ -375,7 +380,7 @@ export async function listPositions(): Promise<PositionRow[]> {
       const mHi = mcapAtTick(st, tu, px, tokMeta.supplyUi);
       const openedAt = dep?.ts ?? (await mintTimestamp(id.toString()));
 
-      rows.push({
+      return {
         tokenId: id.toString(),
         pool,
         tokenAddr: wethIs0 ? ethers.getAddress(p.token1) : ethers.getAddress(p.token0),
@@ -400,11 +405,13 @@ export async function listPositions(): Promise<PositionRow[]> {
         ageMs: openedAt ? Date.now() - openedAt : null,
         ageSource: dep?.ts ? "bot" : openedAt ? "onchain" : null,
         mode: dep?.mode ?? "single",
-      });
+      };
     } catch (e) {
       log.warn(`skip posisi index ${i}: ${errShort(e)}`); // no longer a silent skip
+      return null;
     }
-  }
+    })
+  ).filter((r): r is PositionRow => r !== null);
   return rows;
 }
 

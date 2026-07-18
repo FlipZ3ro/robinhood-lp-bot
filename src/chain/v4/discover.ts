@@ -9,11 +9,13 @@ import { ethers } from "ethers";
 import { C } from "../../config.js";
 import { provider } from "../client.js";
 import { blockscout, mapLimit } from "../blockscout.js";
+import { tokenMeta } from "../tokens.js";
 import { STATEVIEW_ABI } from "./abis.js";
 import { ethPoolKey, computePoolId, NATIVE, V4_FEE_TIERS, type PoolKey } from "./poolkey.js";
 
 const INITIALIZE_TOPIC = ethers.id("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)");
 const DYNAMIC_FEE_FLAG = 0x800000; // fee with this bit = dynamic (hook-set) — not LP-able normally
+export const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"; // Robinhood Chain stable
 
 export interface V4Pool {
   poolKey: PoolKey;
@@ -24,6 +26,7 @@ export interface V4Pool {
   tick: number;
   liquidity: bigint;
   lpFee: number;
+  quote: "eth" | "usd"; // what the token is paired against (native ETH vs USDG stable)
 }
 
 function stateView(): ethers.Contract {
@@ -33,7 +36,7 @@ function stateView(): ethers.Contract {
 
 /** Verify PoolKeys are live (price > 0) and return them with liquidity. Bounded concurrency
  * so a token with 100+ pools doesn't flood the RPC. */
-async function verify(sv: ethers.Contract, keys: Array<{ pk: PoolKey; poolId: string }>): Promise<V4Pool[]> {
+async function verify(sv: ethers.Contract, keys: Array<{ pk: PoolKey; poolId: string }>, quote: "eth" | "usd" = "eth"): Promise<V4Pool[]> {
   const out = await mapLimit(keys, 10, async ({ pk, poolId }): Promise<V4Pool | null> => {
     try {
       const s0 = await sv.getSlot0!(poolId);
@@ -48,6 +51,7 @@ async function verify(sv: ethers.Contract, keys: Array<{ pk: PoolKey; poolId: st
         tick: Number(s0.tick),
         liquidity,
         lpFee: Number(s0.lpFee),
+        quote,
       };
     } catch {
       return null;
@@ -87,12 +91,14 @@ export async function discoverV4Pools(token: string): Promise<V4Pool[]> {
         const fee = parseInt(d.slice(0, 64), 16);
         const tickSpacing = parseInt(d.slice(64, 128), 16); // int24, always positive here
         const hooks = ethers.getAddress("0x" + d.slice(152, 192));
-        if (hooks.toLowerCase() !== NATIVE) continue; // vanilla pools only (LP-able)
-        if (fee >= DYNAMIC_FEE_FLAG) continue; // skip dynamic-fee pools
+        // KEEP hooked pools: on Robinhood the DEEPEST pools (lowest price impact) use a standard
+        // hook — skipping them missed the best pool to buy/LP into. Only dynamic-fee pools are
+        // skipped (their fee isn't known upfront). The real hooks addr rides in the PoolKey.
+        if (fee >= DYNAMIC_FEE_FLAG) continue;
         const poolId: string = lg.topics[1];
         if (seen.has(poolId)) continue;
         seen.add(poolId);
-        keys.push({ pk: { currency0: NATIVE, currency1, fee, tickSpacing, hooks: NATIVE }, poolId });
+        keys.push({ pk: { currency0: NATIVE, currency1, fee, tickSpacing, hooks }, poolId });
       } catch {
         /* skip malformed log */
       }
@@ -110,10 +116,99 @@ export async function discoverV4Pools(token: string): Promise<V4Pool[]> {
   return verify(sv, probeKeys);
 }
 
+/** All live token/USDG v4 pools (token can be currency0 OR currency1, USDG is the other side). */
+export async function discoverV4UsdgPools(token: string): Promise<V4Pool[]> {
+  const pm = C.v4PoolManager;
+  if (!pm) return [];
+  const sv = stateView();
+  const t = ethers.getAddress(token);
+  const tL = t.toLowerCase();
+  const tk = "0x" + t.slice(2).toLowerCase().padStart(64, "0");
+  const usdgL = USDG.toLowerCase();
+  const seen = new Set<string>();
+  const keys: Array<{ pk: PoolKey; poolId: string }> = [];
+  for (const [pos, opr] of [["topic2", "topic0_2_opr"], ["topic3", "topic0_3_opr"]] as const) {
+    const url = `${blockscout}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${pm}&topic0=${INITIALIZE_TOPIC}&${pos}=${tk}&${opr}=and`;
+    let items: any[] = [];
+    try {
+      const r: any = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((x) => x.json());
+      items = Array.isArray(r?.result) ? r.result : [];
+    } catch {
+      continue;
+    }
+    for (const lg of items) {
+      try {
+        const c0 = ("0x" + lg.topics[2].slice(26)).toLowerCase();
+        const c1 = ("0x" + lg.topics[3].slice(26)).toLowerCase();
+        const other = c0 === tL ? c1 : c0;
+        if (other !== usdgL) continue; // token/USDG pools only
+        const d: string = lg.data.slice(2);
+        const fee = parseInt(d.slice(0, 64), 16);
+        const tickSpacing = parseInt(d.slice(64, 128), 16);
+        const hooks = ethers.getAddress("0x" + d.slice(152, 192));
+        if (fee >= DYNAMIC_FEE_FLAG) continue;
+        const poolId: string = lg.topics[1];
+        if (seen.has(poolId)) continue;
+        seen.add(poolId);
+        keys.push({ pk: { currency0: ethers.getAddress(c0), currency1: ethers.getAddress(c1), fee, tickSpacing, hooks }, poolId });
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  return verify(sv, keys.slice(-120), "usd");
+}
+
 /**
  * Pick the v4 pool to LP into: highest fee that still has liquidity above the floor
  * (memecoin farming wants high fee, but a pool with no liquidity has no volume to farm).
  */
+/**
+ * When no ETH-paired pool has liquidity, describe the token's OTHER v4 pools (e.g. token/USDG)
+ * so the user understands why it can't be LP'd with ETH. Returns a short summary or null.
+ */
+export async function nonEthV4Summary(token: string): Promise<string | null> {
+  const pm = C.v4PoolManager;
+  if (!pm) return null;
+  const t = ethers.getAddress(token);
+  const tk = "0x" + t.slice(2).toLowerCase().padStart(64, "0");
+  const sv = stateView();
+  const seen = new Set<string>();
+  const found: { quote: string; fee: number }[] = [];
+  for (const pos of ["topic2", "topic3"]) {
+    const opr = pos === "topic2" ? "topic0_2_opr" : "topic0_3_opr";
+    const url = `${blockscout}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${pm}&topic0=${INITIALIZE_TOPIC}&${pos}=${tk}&${opr}=and`;
+    let items: any[] = [];
+    try {
+      const r: any = await fetch(url, { signal: AbortSignal.timeout(15_000) }).then((x) => x.json());
+      items = Array.isArray(r?.result) ? r.result : [];
+    } catch {
+      continue;
+    }
+    const cand = items
+      .map((lg) => {
+        const c0 = ("0x" + lg.topics[2].slice(26)).toLowerCase();
+        const c1 = ("0x" + lg.topics[3].slice(26)).toLowerCase();
+        const quote = c0 === t.toLowerCase() ? c1 : c0;
+        if (quote === NATIVE) return null; // ETH pools handled elsewhere
+        return { poolId: lg.topics[1] as string, quote, fee: parseInt(lg.data.slice(2, 66), 16) };
+      })
+      .filter(Boolean) as { poolId: string; quote: string; fee: number }[];
+    await mapLimit(cand.slice(-60), 8, async (c) => {
+      if (seen.has(c.poolId)) return;
+      seen.add(c.poolId);
+      const liq: bigint = await sv.getLiquidity!(c.poolId).catch(() => 0n);
+      if (liq > 0n) found.push({ quote: c.quote, fee: c.fee });
+    });
+  }
+  if (!found.length) return null;
+  const quotes = [...new Set(found.map((f) => f.quote))];
+  const qsyms = await Promise.all(quotes.slice(0, 3).map((q) => tokenMeta(q).then((m) => m.symbol).catch(() => q.slice(0, 8))));
+  const fees = found.map((f) => f.fee).sort((a, b) => a - b);
+  const feeRange = `${(fees[0]! / 10000).toFixed(2)}-${(fees[fees.length - 1]! / 10000).toFixed(2)}%`;
+  return `${found.length} pool v4 pair ${qsyms.join("/")} (fee ${feeRange}) — bukan ETH`;
+}
+
 export function pickV4Pool(pools: V4Pool[], minLiquidity = 1n): V4Pool | null {
   const eligible = pools.filter((p) => p.liquidity >= minLiquidity);
   if (!eligible.length) return null;

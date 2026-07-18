@@ -28,6 +28,9 @@ export function appendLedger(entry: LedgerEntry): void {
   entries.push(entry);
   writeJson(LEDGER_FILE, { entries });
 }
+export function writeLedger(entries: LedgerEntry[]): void {
+  writeJson(LEDGER_FILE, { entries });
+}
 
 export interface LedgerSummary {
   count: number;

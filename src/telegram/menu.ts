@@ -7,8 +7,9 @@
 export const MENU_KEYBOARD = {
   keyboard: [
     ["📋 Posisi", "📒 Ledger", "💰 PnL"],
-    ["📡 Feed", "👁 Watch", "🤖 Auto"],
-    ["🔍 Scan", "👛 Wallet", "⚙️ Setting"],
+    ["🧪 Screen", "🔍 Scan", "📸 Kartu"],
+    ["🔄 Swap", "📡 Feed", "👁 Watch"],
+    ["🤖 Auto", "👛 Wallet", "⚙️ Setting"],
     ["🗑 Close All", "💸 Sell", "❔ Help"],
   ],
   resize_keyboard: true,
@@ -22,7 +23,10 @@ const MENU_MAP: Record<string, string> = {
   "📡 Feed": "/feed",
   "👁 Watch": "/watch",
   "🤖 Auto": "/auto",
+  "🧪 Screen": "/screen",
   "🔍 Scan": "/scan",
+  "📸 Kartu": "/card",
+  "🔄 Swap": "/swap",
   "👛 Wallet": "/wallet",
   "⚙️ Setting": "/settings",
   "🗑 Close All": "/closeall",
