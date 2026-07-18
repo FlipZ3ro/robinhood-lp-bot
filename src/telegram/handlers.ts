@@ -418,8 +418,24 @@ export async function onLedger(page = 0, mid: number | null = null): Promise<voi
   nav.push({ text: `${page + 1}/${pages}`, callback_data: `lg:${page}` });
   if (page < pages - 1) nav.push({ text: "Next ▶️", callback_data: `lg:${page + 1}` });
 
-  const head = `📒 <b>Ledger LP</b> · ${all.length} posisi ditutup`;
-  await out(head + "\n" + pre(T.join("\n")) + pre(S.join("\n")), {
+  // v4 closed positions (only on page 0). v4 PnL isn't reconstructable from the singleton
+  // PoolManager the way v3 is, so we list the pairs; PnL shows only where a deposit was tracked.
+  let v4block = "";
+  if (page === 0) {
+    const { listClosedV4Positions } = await import("../chain/v4/list.js");
+    const closed = await listClosedV4Positions().catch(() => []);
+    if (closed.length) {
+      const V: string[] = [`🦄 v4 DITUTUP · ${closed.length} posisi`, "─".repeat(37)];
+      closed.slice(0, 15).forEach((r) => {
+        V.push(`${tokenEmoji(r.pair)} ${r.pair}  fee ${(r.fee / 10000).toFixed(2)}%  #${r.tokenId}${r.depEth != null ? "  modal " + r.depEth.toFixed(4) + "Ξ" : ""}`);
+      });
+      if (closed.length > 15) V.push(`… +${closed.length - 15} lagi`);
+      v4block = pre(V.join("\n")) + `<i>PnL historis v4 nggak direkonstruksi (event di PoolManager singleton).</i>`;
+    }
+  }
+
+  const head = `📒 <b>Ledger LP</b> · ${all.length} v3 ditutup`;
+  await out(head + "\n" + pre(T.join("\n")) + pre(S.join("\n")) + v4block, {
     reply_markup: { inline_keyboard: [nav, [{ text: "🔄 Rebuild dari on-chain", callback_data: "lgrb" }]] },
   });
 }

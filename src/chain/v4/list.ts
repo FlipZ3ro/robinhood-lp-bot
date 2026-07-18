@@ -48,6 +48,46 @@ export interface V4Row {
 
 const signed24 = (v: number): number => (v >= 0x800000 ? v - 0x1000000 : v);
 
+export interface V4ClosedRow {
+  tokenId: string;
+  pair: string;
+  fee: number;
+  depEth: number | null; // basis only if bot-minted
+}
+
+/** v4 NFTs the wallet still holds but with 0 liquidity = closed positions (for /ledger). */
+export async function listClosedV4Positions(): Promise<V4ClosedRow[]> {
+  if (!C.v4PositionManager) return [];
+  const w = wallet();
+  const posmL = C.v4PositionManager.toLowerCase();
+  const deps = readJson<Record<string, { depositWei: string }>>(dataPath("v4-positions.json"), {});
+  let ids: string[] = [];
+  try {
+    const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
+    ids = (nft?.items ?? []).filter((i) => (i.token?.address_hash || "").toLowerCase() === posmL).map((i) => String(i.id));
+  } catch {
+    /* */
+  }
+  if (!ids.length) return [];
+  const posm = new ethers.Contract(C.v4PositionManager, V4_POSM_ABI, provider);
+  const rows = await mapLimit(ids, 8, async (tokenId): Promise<V4ClosedRow | null> => {
+    try {
+      const liq: bigint = await posm.getPositionLiquidity!(tokenId).catch(() => 0n);
+      if (liq > 0n) return null; // still open → shown in /list, not ledger
+      const [pk] = await posm.getPoolAndPositionInfo!(tokenId);
+      const [m0, m1] = await Promise.all([
+        pk.currency0.toLowerCase() === NATIVE ? Promise.resolve({ symbol: "ETH" }) : tokenMeta(pk.currency0).catch(() => ({ symbol: "?" })),
+        pk.currency1.toLowerCase() === NATIVE ? Promise.resolve({ symbol: "ETH" }) : tokenMeta(pk.currency1).catch(() => ({ symbol: "?" })),
+      ]);
+      const dep = deps[tokenId];
+      return { tokenId, pair: `${m0.symbol}/${m1.symbol}`, fee: Number(pk.fee), depEth: dep ? Number(ethers.formatEther(dep.depositWei)) : null };
+    } catch {
+      return null;
+    }
+  });
+  return rows.filter((r): r is V4ClosedRow => r !== null);
+}
+
 function sdkCurrency(addr: string, dec: number, sym: string): any {
   return addr.toLowerCase() === NATIVE ? Ether.onChain(cfg.chainId) : new Token(cfg.chainId, ethers.getAddress(addr), dec, sym);
 }
