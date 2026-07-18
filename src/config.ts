@@ -174,7 +174,7 @@ export const env = {
   sequencerIp: process.env.RH_SEQUENCER_IP?.trim() || "",
   // LLM radar (OpenRouter) + GMGN enrichment
   openrouterKey: (process.env.RH_OPENROUTER_KEY || "").trim(),
-  openrouterModel: process.env.RH_OPENROUTER_MODEL?.trim() || "qwen/qwen3-next-80b-a3b-instruct:free",
+  openrouterModel: process.env.RH_OPENROUTER_MODEL?.trim() || "nvidia/nemotron-3-super-120b-a12b:free",
   gmgnKey: (process.env.RH_GMGN_KEY || "").trim(),
 };
 
