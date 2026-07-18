@@ -325,17 +325,20 @@ export async function onList(mid: number | null = null): Promise<void> {
     T4.push("─".repeat(37));
     v4rows.forEach((r, i) => {
       if (i) T4.push("");
-      T4.push(`${tokenEmoji(r.sym)} ${r.sym}  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
-      T4.push(`   ${r.inRange ? "🟢 IN RANGE" : "🔴 OUT OF RANGE"} (single-side)`);
-      T4.push(`   ${padR("modal", 7)} ${padL(r.depEth != null ? r.depEth.toFixed(6) + "Ξ" : "—", 11)}  ${padL(r.depEth != null ? usd(r.depEth) : "—", 9)}`);
-      T4.push(`   ${padR("nilai", 7)} ${padL(r.valEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.valEth), 9)}`);
-      T4.push(`   ${padR("umur", 7)} ${padL(fmtAge(r.ageMs), 11)}`);
-      if (r.pnlEth != null)
-        T4.push(`   ${padR("PnL", 7)} ${padL(sg(r.pnlEth, 6) + "Ξ", 11)}  ${padL((r.pnlEth >= 0 ? "+" : "-") + "$" + Math.abs(r.pnlEth * px).toFixed(2), 9)}`);
+      T4.push(`${tokenEmoji(r.sym)} ${r.pair}  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
+      T4.push(`   ${r.inRange ? "🟢 IN RANGE" : "🔴 OUT OF RANGE"}${r.ethPaired ? "" : " · non-ETH pair"}`);
+      T4.push(`   ${padR("nilai", 7)} $${r.valueUsd.toFixed(2)}`);
+      T4.push(`   ${padR("isi", 7)} ${r.amount0} ${r.sym0} + ${r.amount1} ${r.sym1}`);
+      T4.push(`   ${padR("fee", 7)} $${r.feeUsd.toFixed(2)} earned`);
+      if (r.depEth != null) T4.push(`   ${padR("modal", 7)} ${r.depEth.toFixed(6)}Ξ (${usd(r.depEth)})`);
+      T4.push(`   ${padR("umur", 7)} ${fmtAge(r.ageMs)}`);
     });
     for (const r of v4rows) {
-      const p = r.pnlEth != null ? ` ${r.pnlEth >= 0 ? "🟩" : "🟥"} ${r.pnlEth >= 0 ? "+" : "-"}$${Math.abs(r.pnlEth * px).toFixed(2)}` : "";
-      btns.push([{ text: `🦄 Close v4 ${r.sym} #${r.tokenId}${p}`, callback_data: `v4c:${r.tokenId}` }]);
+      const feeTag = r.feeUsd > 0.01 ? ` 💵$${r.feeUsd.toFixed(2)}` : "";
+      btns.push([
+        { text: `🧲 Claim fee ${r.sym}${feeTag}`, callback_data: `v4f:${r.tokenId}` },
+        { text: `🦄 Close #${r.tokenId}`, callback_data: `v4c:${r.tokenId}` },
+      ]);
     }
   }
 
@@ -623,13 +626,11 @@ export async function onV4Close(text: string): Promise<void> {
   try {
     const { closeV4Position } = await import("../chain/v4/close.js");
     const r = await closeV4Position(tokenId);
-    const px = await ethUsd().catch(() => 0);
     await edit(
       mid,
       [
         `✅ <b>v4 #${tokenId} closed</b> · fee ${(r.fee / 10000).toFixed(2)}%`,
-        `Balik: ${r.recvEth.toFixed(6)}Ξ${r.recvToken > 0 ? ` + ${r.recvToken.toFixed(2)} ${r.tokenSym}` : ""}`,
-        r.pnlEth != null ? `PnL: ${r.pnlEth >= 0 ? "+" : ""}${r.pnlEth.toFixed(6)}Ξ${px ? ` (${r.pnlEth >= 0 ? "+" : ""}$${(r.pnlEth * px).toFixed(2)})` : ""}` : "",
+        `Balik: ${r.recv0 > 0 ? `${r.recv0.toFixed(6)} ${r.sym0}` : ""}${r.recv0 > 0 && r.recv1 > 0 ? " + " : ""}${r.recv1 > 0 ? `${r.recv1.toFixed(6)} ${r.sym1}` : ""}`,
         `tx: <a href="${explorerTx(r.txHash)}">tx</a>`,
       ]
         .filter(Boolean)
@@ -637,6 +638,26 @@ export async function onV4Close(text: string): Promise<void> {
     );
   } catch (e) {
     await edit(mid, `❌ v4 close gagal: ${short(e, 160)}`);
+  }
+}
+
+export async function onV4Collect(tokenId: string): Promise<void> {
+  const m = await send(`⏳ Claim fee v4 #${tokenId}…`);
+  const mid = m?.result?.message_id;
+  try {
+    const { collectV4Fees } = await import("../chain/v4/close.js");
+    const r = await collectV4Fees(tokenId);
+    const got = [r.fee0 > 0 ? `${r.fee0.toFixed(6)} ${r.sym0}` : "", r.fee1 > 0 ? `${r.fee1.toFixed(6)} ${r.sym1}` : ""].filter(Boolean).join(" + ");
+    await edit(
+      mid,
+      [
+        `✅ <b>Fee di-claim · v4 #${tokenId}</b>`,
+        got ? `Dapet: ${got}` : `Nggak ada fee buat di-claim.`,
+        `tx: <a href="${explorerTx(r.txHash)}">tx</a>`,
+      ].join("\n"),
+    );
+  } catch (e) {
+    await edit(mid, `❌ Claim fee gagal: ${short(e, 160)}`);
   }
 }
 

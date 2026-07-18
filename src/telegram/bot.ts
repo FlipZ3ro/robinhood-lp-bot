@@ -39,6 +39,7 @@ async function routeCallback(cq: any): Promise<void> {
     await call("editMessageText", { chat_id: chatId, message_id: mid, text: "❌ Dibatalkan.", parse_mode: "HTML" });
     return;
   }
+  if (d.startsWith("v4f:")) return H.onV4Collect(d.split(":")[1]!);
   if (d.startsWith("v4c:")) return H.onV4Close("/v4close " + d.split(":")[1]);
   if (d.startsWith("close:")) return H.onCloseAsk(d.split(":")[1]!, mid);
   if (d.startsWith("cs:")) return H.onClose(d.split(":")[1]!, mid, true);
