@@ -16,6 +16,8 @@
 
 Paste CA → pilih pool → ketik jumlah ETH → posisi kebuka. Sekarang juga.
 
+🌐 **Bahasa Indonesia** · [English](README.en.md)
+
 </div>
 
 ---
