@@ -1,13 +1,12 @@
 /**
- * OpenRouter chat-completion client for the LLM screener. Model defaults to a free tier
- * (`openai/gpt-oss-20b:free`, same as the meridian reference); override with
- * RH_OPENROUTER_MODEL. Best-effort: returns null if no key or on any failure.
+ * LLM screener client — any OpenAI-compatible chat-completions endpoint (OpenRouter by
+ * default; RH_OPENROUTER_URL points it at a custom gateway). stream:false so we always get
+ * one JSON body. Best-effort: returns null if no key or on any failure.
  */
 import { env } from "../config.js";
 import { logger } from "../util/log.js";
 
 const log = logger("llm");
-const URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export interface LlmVerdict {
   score: number; // 0..100 conviction
@@ -24,13 +23,14 @@ export async function llmScore(system: string, user: string): Promise<LlmVerdict
       { role: "user", content: user },
     ],
     response_format: { type: "json_object" },
+    stream: false, // some gateways stream by default; we want one JSON body
     temperature: 0.2,
     max_tokens: 1200,
   });
   // Free models throttle upstream (HTTP 429 with Retry-After) — retry once, briefly.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(URL, {
+      const res = await fetch(env.openrouterUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${env.openrouterKey}`, "Content-Type": "application/json", "X-Title": "Robinhood LP Bot" },
         body,

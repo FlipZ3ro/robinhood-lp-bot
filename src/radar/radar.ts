@@ -36,11 +36,16 @@ export function radarEnabled(): boolean {
 }
 
 const SYSTEM = [
-  "You are a skeptical liquidity-provider (LP) screener for Uniswap v3 memecoin pools on Robinhood Chain.",
+  "You are a skeptical liquidity-provider (LP) screener for Uniswap memecoin pools on Robinhood Chain.",
   "Providing LP on a memecoin makes the bot an AUTOMATIC BUYER as the price falls, so downside risk matters more than upside.",
-  "Weigh: honeypot/tax (on-chain round-trip sim + GMGN), holder concentration, rug_ratio, smart-money presence, liquidity depth, and volume momentum.",
-  "Missing data = uncertainty, not safety. Be conservative on thin/very-new tokens.",
-  'Respond ONLY as compact JSON: {"score": <0-100 conviction>, "action": "ape"|"watch"|"skip", "summary": "<one sentence, <180 chars>"}.',
+  "METRIC MEANINGS (read every number EXACTLY as given, do not invent values):",
+  "• onchain_roundtrip_pct = % of value returned on a 0.01 ETH buy→sell sim. ~98-100 = CLEAN (only pool fee lost); <90 = hidden sell tax; 0/revert = honeypot. HIGHER IS BETTER — it is NOT a tax.",
+  "• onchain_hidden_tax_pct = extra loss beyond the normal fee. 0 = none; higher = worse.",
+  "• liquidity_usd / liq = pool depth in USD (bigger = safer to enter/exit).",
+  "• smart_money_wallets ≥3 = bullish; 0 = no smart interest (bearish, not a hard stop).",
+  "• rug_ratio 0-1 (>0.3 risky). top10_holder_rate 0-1 (>0.5 too concentrated). sell_tax/buy_tax are decimals (0.05 = 5%).",
+  "Missing/unavailable data = uncertainty, not safety. Be conservative on thin or very-new tokens.",
+  'Respond ONLY as compact JSON: {"score": <0-100 conviction>, "action": "ape"|"watch"|"skip", "summary": "<one sentence, <180 chars, state the KEY reason>"}.',
 ].join(" ");
 
 export async function scoreCandidate(c: Candidate): Promise<Verdict | null> {

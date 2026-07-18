@@ -172,8 +172,10 @@ export const env = {
   fastSubmit: /^(1|true|yes|on)$/i.test(process.env.RH_FAST_SUBMIT?.trim() || ""),
   sequencerUrl: process.env.RH_SEQUENCER_URL?.trim() || DEFAULT_SEQUENCER,
   sequencerIp: process.env.RH_SEQUENCER_IP?.trim() || "",
-  // LLM radar (OpenRouter) + GMGN enrichment
+  // LLM radar — any OpenAI-compatible endpoint (OpenRouter default; override RH_OPENROUTER_URL
+  // for a custom gateway, e.g. agentcash). + GMGN enrichment.
   openrouterKey: (process.env.RH_OPENROUTER_KEY || "").trim(),
+  openrouterUrl: process.env.RH_OPENROUTER_URL?.trim() || "https://openrouter.ai/api/v1/chat/completions",
   openrouterModel: process.env.RH_OPENROUTER_MODEL?.trim() || "nvidia/nemotron-3-super-120b-a12b:free",
   gmgnKey: (process.env.RH_GMGN_KEY || "").trim(),
 };
