@@ -252,15 +252,17 @@ export async function onList(mid: number | null = null): Promise<void> {
     mid = m?.result?.message_id ?? null;
   }
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
-  let rows;
-  try {
-    rows = await listPositions();
-  } catch (e) {
-    await out(`❌ ${short(e, 80)}`);
+  const { listV4Positions } = await import("../chain/v4/list.js");
+  // v3 + v4 in parallel (was sequential → slow "Memuat posisi…")
+  const [rowsRes, v4rows] = await Promise.all([
+    listPositions().then((r) => ({ ok: true as const, r })).catch((e) => ({ ok: false as const, e })),
+    listV4Positions().catch(() => []),
+  ]);
+  if (!rowsRes.ok) {
+    await out(`❌ ${short(rowsRes.e, 80)}`);
     return;
   }
-  const { listV4Positions } = await import("../chain/v4/list.js");
-  const v4rows = await listV4Positions().catch(() => []);
+  const rows = rowsRes.r;
   const refreshBtn = [{ text: "🔄 Refresh", callback_data: "refresh" }];
   if (!rows.length && !v4rows.length) {
     await out("Tidak ada posisi LP terbuka (v3/v4).", { reply_markup: { inline_keyboard: [refreshBtn] } });

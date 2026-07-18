@@ -7,6 +7,7 @@
  * locked and persisted). Every inbound update is checked with isOwner() before routing.
  */
 import { env, cfg, persist } from "../config.js";
+import { MENU_KEYBOARD } from "./menu.js";
 import { logger } from "../util/log.js";
 
 const log = logger("tg");
@@ -54,12 +55,16 @@ type Extra = Record<string, unknown>;
 /** Send a message to the owner chat. */
 export function send(text: string, extra: Extra = {}): Promise<any> {
   if (!owner) return Promise.resolve(null); // nothing to send to yet
+  // Re-affirm the persistent bottom menu on every plain-text message so it never gets lost.
+  // Messages that carry their own inline keyboard keep it (reply keyboard persists separately).
+  const reply_markup = (extra as { reply_markup?: unknown }).reply_markup ?? MENU_KEYBOARD;
   return call("sendMessage", {
     chat_id: owner,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
     ...extra,
+    reply_markup,
   });
 }
 

@@ -88,12 +88,26 @@ async function handle(u: any): Promise<void> {
 }
 
 async function registerCommands(): Promise<void> {
-  // Remove the "/" command menu + Menu button. They share the bottom bar with the persistent
-  // reply keyboard, so Telegram collapses the keyboard whenever the command menu is available
-  // (the "menu keeps disappearing" bug). The bottom keyboard covers the common actions;
-  // parameterized commands (/v4, /v4lp, /set, /v4close) are still typed manually.
-  await call("deleteMyCommands", {});
-  await call("setChatMenuButton", { menu_button: { type: "default" } });
+  // Both the "/" command menu AND the persistent bottom reply keyboard. The keyboard now
+  // re-affirms on every plain-text send() (see tg.ts) so it no longer gets lost.
+  await call("setChatMenuButton", { menu_button: { type: "commands" } });
+  await call("setMyCommands", {
+    commands: [
+      { command: "list", description: "📋 Posisi LP terbuka (v3+v4) + close" },
+      { command: "ledger", description: "📒 Riwayat posisi ditutup (realized PnL)" },
+      { command: "pnl", description: "💰 PnL seumur hidup" },
+      { command: "feed", description: "📡 Monitor sequencer real-time" },
+      { command: "watch", description: "👁 Pemantau lonjakan volume" },
+      { command: "scan", description: "🔍 Cek lonjakan volume sekarang" },
+      { command: "auto", description: "🤖 Auto-LP (radar → buka otomatis)" },
+      { command: "v4", description: "🦄 Cek pool Uniswap v4 sebuah token CA" },
+      { command: "closeall", description: "🗑 Tutup SEMUA posisi" },
+      { command: "sell", description: "💸 Jual token nyangkut → ETH" },
+      { command: "wallet", description: "👛 Saldo hot wallet" },
+      { command: "settings", description: "⚙️ Width, slippage, dll" },
+      { command: "help", description: "❔ Bantuan + menu" },
+    ],
+  });
 }
 
 export function stop(): void {

@@ -11,7 +11,7 @@ import { wallet, provider } from "../client.js";
 import { tokenMeta } from "../tokens.js";
 import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { NATIVE } from "./poolkey.js";
-import { bsFetch } from "../blockscout.js";
+import { bsFetch, mapLimit } from "../blockscout.js";
 import { dataPath, readJson } from "../../util/files.js";
 import { logger } from "../../util/log.js";
 
@@ -62,14 +62,16 @@ export async function listV4Positions(): Promise<V4Row[]> {
   const posm = new ethers.Contract(C.v4PositionManager, V4_POSM_ABI, provider);
   const sv = new ethers.Contract(C.v4StateView, STATEVIEW_ABI, provider);
   const coder = ethers.AbiCoder.defaultAbiCoder();
-  const rows: V4Row[] = [];
 
-  for (const tokenId of ids) {
+  // Process all tokenIds in parallel (bounded) — was sequential over ~13 NFTs = slow /list.
+  const rows = await mapLimit(ids, 8, async (tokenId): Promise<V4Row | null> => {
     try {
-      const owner: string = await posm.ownerOf!(tokenId).catch(() => ethers.ZeroAddress);
-      if (owner.toLowerCase() !== w.address.toLowerCase()) continue; // burned/transferred
-      const liquidity: bigint = await posm.getPositionLiquidity!(tokenId).catch(() => 0n);
-      if (liquidity === 0n) continue;
+      // cheap gate first: ownership + liquidity in parallel; skip closed/transferred fast
+      const [owner, liquidity] = await Promise.all([
+        posm.ownerOf!(tokenId).catch(() => ethers.ZeroAddress) as Promise<string>,
+        posm.getPositionLiquidity!(tokenId).catch(() => 0n) as Promise<bigint>,
+      ]);
+      if (owner.toLowerCase() !== w.address.toLowerCase() || liquidity === 0n) return null;
 
       const [pk, infoRaw] = await posm.getPoolAndPositionInfo!(tokenId);
       const info = BigInt(infoRaw);
@@ -78,16 +80,14 @@ export async function listV4Positions(): Promise<V4Row[]> {
       const fee = Number(pk.fee);
       const tickSpacing = Number(pk.tickSpacing);
       const tokenAddr = pk.currency0.toLowerCase() === NATIVE ? pk.currency1 : pk.currency0;
-      const meta = await tokenMeta(tokenAddr).catch(() => ({ symbol: "?", decimals: 18 }));
-
       const poolId = ethers.keccak256(
-        coder.encode(
-          ["address", "address", "uint24", "int24", "address"],
-          [pk.currency0, pk.currency1, fee, tickSpacing, pk.hooks],
-        ),
+        coder.encode(["address", "address", "uint24", "int24", "address"], [pk.currency0, pk.currency1, fee, tickSpacing, pk.hooks]),
       );
-      const s0 = await sv.getSlot0!(poolId);
-      const poolLiq: bigint = await sv.getLiquidity!(poolId).catch(() => 0n);
+      const [meta, s0, poolLiq] = await Promise.all([
+        tokenMeta(tokenAddr).catch(() => ({ symbol: "?", decimals: 18 })),
+        sv.getSlot0!(poolId),
+        sv.getLiquidity!(poolId).catch(() => 0n) as Promise<bigint>,
+      ]);
       const tick = Number(s0.tick);
 
       const eth = Ether.onChain(cfg.chainId);
@@ -95,12 +95,10 @@ export async function listV4Positions(): Promise<V4Row[]> {
       const pool = new Pool(eth, tok, fee, tickSpacing, pk.hooks, s0.sqrtPriceX96.toString(), poolLiq.toString(), tick);
       const pos = new Position({ pool, liquidity: liquidity.toString(), tickLower, tickUpper });
 
-      // value in ETH: native side + token side priced at current pool price
       const amt0Eth = Number(pos.amount0.toExact()); // ETH (currency0)
       let amt1Eth = 0;
       try {
-        const price = pool.priceOf(tok); // token price in ETH
-        amt1Eth = Number(price.quote(pos.amount1).toExact());
+        amt1Eth = Number(pool.priceOf(tok).quote(pos.amount1).toExact()); // token side priced in ETH
       } catch {
         /* price edge */
       }
@@ -108,7 +106,7 @@ export async function listV4Positions(): Promise<V4Row[]> {
       const dep = deps[tokenId];
       const depEth = dep ? Number(ethers.formatEther(dep.depositWei)) : null;
 
-      rows.push({
+      return {
         tokenId,
         sym: meta.symbol,
         fee,
@@ -120,10 +118,11 @@ export async function listV4Positions(): Promise<V4Row[]> {
         depEth,
         pnlEth: depEth != null ? valEth - depEth : null,
         ageMs: dep?.ts ? Date.now() - dep.ts : null,
-      });
+      };
     } catch (e) {
       log.warn(`skip v4 #${tokenId}: ${(e as Error).message.slice(0, 80)}`);
+      return null;
     }
-  }
-  return rows;
+  });
+  return rows.filter((r): r is V4Row => r !== null);
 }
