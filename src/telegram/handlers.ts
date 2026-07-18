@@ -12,8 +12,7 @@ import { topVolumeNow, wcfg, usingOwnWatchRpc } from "../watch/scanner.js";
 import { startWatch, stopWatch, restartWatch, isWatchOn } from "./watchLoop.js";
 import { startFeed, stopFeed, feedStatus } from "./feedLoop.js";
 import { autoLpStatus } from "../radar/autolp.js";
-import { MENU_KEYBOARD } from "./menu.js";
-import { send, edit, explorerTx } from "./tg.js";
+import { send, sendMenu, edit, explorerTx } from "./tg.js";
 import { esc, pre, padR, padL, sg, money, tokenEmoji } from "./format.js";
 import { fmtMcap, fmtAge } from "../util/format.js";
 import type { PoolInfo, TokenMeta, MintMode } from "../types.js";
@@ -792,7 +791,7 @@ export async function onPnl(): Promise<void> {
   }
   const u = (e: number) => (r.px ? `$${(e * r.px).toFixed(2)}` : "?");
   const emo = r.pnlEth > 0 ? "🟢" : r.pnlEth < 0 ? "🔴" : "⚪";
-  await send(
+  await sendMenu(
     [
       `📊 <b>PnL SEUMUR HIDUP</b>${r.px ? ` · ETH $${r.px.toFixed(0)}` : ""}`,
       ``,
@@ -816,7 +815,7 @@ export async function onSell(): Promise<void> {
     const r = await sellAllTokens((msg) => {
       void send(msg).catch(() => {});
     });
-    await send(
+    await sendMenu(
       [
         `🏁 <b>Selesai jual</b> — ${r.sold} token → ETH${r.skipped ? `, ${r.skipped} di-skip (rug)` : ""}`,
         `💰 Total dapet: <b>+${r.soldEth.toFixed(6)} WETH ($${r.soldUsd.toFixed(2)})</b>`,
@@ -830,7 +829,7 @@ export async function onSell(): Promise<void> {
 export async function onWallet(): Promise<void> {
   try {
     const b = await balances();
-    await send(`👛 <code>${b.address}</code>\nETH: ${Number(b.eth).toFixed(5)} · WETH: ${Number(b.weth).toFixed(5)}`);
+    await sendMenu(`👛 <code>${b.address}</code>\nETH: ${Number(b.eth).toFixed(5)} · WETH: ${Number(b.weth).toFixed(5)}`);
   } catch (e) {
     await send(`❌ ${short(e, 80)}`);
   }
@@ -849,7 +848,7 @@ export async function onSettings(): Promise<void> {
     `${padR("auto-LP", 12)} ${cfg.autoLp.enabled ? "🟢 ON" : "off"}`,
     `${padR("fast-submit", 12)} ${env.fastSubmit ? "on" : "off"}`,
   ];
-  await send(
+  await sendMenu(
     `⚙️ <b>Setting</b>${pre(T.join("\n"))}` +
       `Ubah: <code>/set width 40</code> · <code>/set slippage 5</code> · <code>/set gastarget 0.015</code>\n` +
       `<i>Watch/Feed/Auto/Radar diatur di menu masing-masing.</i>`,
@@ -967,7 +966,7 @@ export async function onHelp(): Promise<void> {
     ``,
     `<i>Menu cepat ada di bawah 👇 — nggak perlu ngetik.</i>`,
   ].join("\n");
-  await send(body, { reply_markup: MENU_KEYBOARD });
+  await sendMenu(body);
 }
 
 // per-message pending accessors for bot.ts routing

@@ -55,17 +55,23 @@ type Extra = Record<string, unknown>;
 /** Send a message to the owner chat. */
 export function send(text: string, extra: Extra = {}): Promise<any> {
   if (!owner) return Promise.resolve(null); // nothing to send to yet
-  // Re-affirm the persistent bottom menu on every plain-text message so it never gets lost.
-  // Messages that carry their own inline keyboard keep it (reply keyboard persists separately).
-  const reply_markup = (extra as { reply_markup?: unknown }).reply_markup ?? MENU_KEYBOARD;
+  // NOTE: do NOT auto-attach the reply keyboard here — a message sent with a reply keyboard
+  // CANNOT be edited later ("message can't be edited"), which breaks every send-then-edit
+  // flow (/list "Memuat posisi…" → results). The keyboard is is_persistent (set on /start)
+  // and re-affirmed only on final, non-edited responses via sendMenu().
   return call("sendMessage", {
     chat_id: owner,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
     ...extra,
-    reply_markup,
   });
+}
+
+/** Send a FINAL text response that also re-affirms the persistent bottom menu.
+ * Use ONLY for messages that will NOT be edited afterwards. */
+export function sendMenu(text: string): Promise<any> {
+  return send(text, { reply_markup: MENU_KEYBOARD });
 }
 
 /** Edit a message in the owner chat. */
