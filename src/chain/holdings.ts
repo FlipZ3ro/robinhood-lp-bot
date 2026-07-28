@@ -4,13 +4,61 @@ import { C } from "../config.js";
 import { wallet, provider } from "./client.js";
 import { ERC20_ABI } from "./abis.js";
 import { quoteTokenToWeth, swapTokenToWeth } from "./swaps.js";
+import { kyberRoute, kyberEnabled, KYBER_NATIVE } from "./kyber.js";
 import { ethUsd } from "./price.js";
-import { bsFetch } from "./blockscout.js";
+import { bsFetch, mapLimit } from "./blockscout.js";
 
 export interface Balances {
   address: string;
   eth: string;
   weth: string;
+}
+
+/** One sellable ERC-20 holding, valued by its actual Kyber sell-route → ETH. */
+export interface WalletToken {
+  addr: string;
+  symbol: string;
+  decimals: number;
+  raw: bigint;
+  ui: number;
+  ethOut: number; // ETH you'd get selling ALL of it (Kyber quote)
+  usd: number;
+}
+
+/**
+ * Non-WETH ERC-20 holdings the wallet can ACTUALLY sell → ETH, richest first, dust dropped.
+ * Valued via the KyberSwap aggregator (not v3-only quoting) so USDG-paired tokens like JACKET are
+ * caught too, and un-sellable junk (no route) is filtered out. `cap` bounds the Kyber calls.
+ */
+export async function walletTokens(minUsd = 0.1, cap = 25): Promise<WalletToken[]> {
+  if (!kyberEnabled()) return [];
+  const w = wallet();
+  const wethL = C.weth.toLowerCase();
+  const px = await ethUsd().catch(() => 0);
+  const tk = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/tokens`).catch(() => null);
+  const items = (tk?.items ?? [])
+    .filter((it) => it.token?.type === "ERC-20" && it.token.address_hash && it.token.address_hash.toLowerCase() !== wethL && BigInt(it.value ?? "0") > 0n)
+    .slice(0, cap);
+  if (!items.length) return [];
+  const rows = await mapLimit(items, 8, async (it: any): Promise<WalletToken | null> => {
+    try {
+      const addr = ethers.getAddress(it.token.address_hash);
+      const dec = Number(it.token.decimals ?? 18);
+      const raw = BigInt(it.value);
+      const route = await Promise.race([
+        kyberRoute(addr, KYBER_NATIVE, raw),
+        new Promise<null>((res) => setTimeout(() => res(null), 6000)),
+      ]);
+      if (!route) return null; // no sell route → hide (can't swap it anyway)
+      const ethOut = Number(ethers.formatEther(BigInt(route.routeSummary.amountOut)));
+      const usd = ethOut * px;
+      if (usd < minUsd) return null;
+      return { addr, symbol: it.token.symbol ?? "?", decimals: dec, raw, ui: Number(ethers.formatUnits(raw, dec)), ethOut, usd };
+    } catch {
+      return null;
+    }
+  });
+  return rows.filter((r): r is WalletToken => r !== null).sort((a, b) => b.usd - a.usd);
 }
 
 export async function balances(): Promise<Balances> {

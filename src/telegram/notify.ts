@@ -7,6 +7,9 @@ import type { Verdict } from "../radar/radar.js";
 import type { AutoLpResult } from "../radar/autolp.js";
 import type { SpikeHit } from "../types.js";
 import type { NewTokenAlert, OutOfRangeAlert } from "../feed/monitor.js";
+import type { ScreenResult } from "../radar/screen.js";
+import type { QualifiedPool } from "../chain/candidate.js";
+import type { AutoCloseInfo } from "../radar/automanage.js";
 
 /** Render an LLM/GMGN radar verdict as message lines (empty if no verdict). */
 function radarLines(v: Verdict | null): string[] {
@@ -31,7 +34,7 @@ function radarLines(v: Verdict | null): string[] {
   return out;
 }
 
-export async function notifySpike(h: SpikeHit, verdict: Verdict | null = null): Promise<void> {
+export async function notifySpike(h: SpikeHit, verdict: Verdict | null = null, pool: QualifiedPool | null = null): Promise<void> {
   const arrow =
     h.prevVol5m > 0
       ? `$${(h.prevVol5m / 1000).toFixed(0)}k → $${(h.vol5m / 1000).toFixed(0)}k`
@@ -42,6 +45,7 @@ export async function notifySpike(h: SpikeHit, verdict: Verdict | null = null): 
     `${padR("likuid", 8)} $${(h.liq / 1000).toFixed(0)}k`,
   ];
   if (h.fdv) T.push(`${padR("MCAP", 8)} ${fmtMcap(h.fdv)}`);
+  if (pool) T.push(`${padR("pool LP", 8)} v4 ${pool.quote.toUpperCase()} · fee ${(pool.fee / 10000).toFixed(2)}% · vol $${(pool.volUsd / 1000).toFixed(0)}k`);
   T.push(
     `${padR("harga", 8)} ${h.chg5m >= 0 ? "+" : ""}${h.chg5m.toFixed(1)}% (5m) · ${h.chg1h >= 0 ? "+" : ""}${h.chg1h.toFixed(1)}% (1h)`,
   );
@@ -102,6 +106,43 @@ export async function notifyNewToken(a: NewTokenAlert, verdict: Verdict | null =
   );
 }
 
+/** Quality LP candidate from the hunter: passed screening + busy + has a 3-5% v4 pool. */
+export async function notifyCandidate(r: ScreenResult, pool: QualifiedPool): Promise<void> {
+  const t = r.token;
+  const verd = r.verdict === "ape" ? "🟢 APE" : r.verdict === "watch" ? "🟡 WATCH" : r.verdict === "skip" ? "🔴 SKIP" : "";
+  const turnover = t.liquidity > 0 ? (t.volume / t.liquidity).toFixed(1) + "×" : "?";
+  const T = [
+    `${padR("pool", 9)} v4 ${pool.quote.toUpperCase()} · fee ${(pool.fee / 10000).toFixed(2)}%`,
+    `${padR("vol pool", 9)} $${(pool.volUsd / 1000).toFixed(1)}k (24h)`,
+    `${padR("liq pool", 9)} $${(pool.liqUsd / 1000).toFixed(1)}k`,
+    `${padR("mcap", 9)} ${fmtMcap(t.marketCap)} · turnover ${turnover}`,
+    `${padR("jenis", 9)} ${r.kind} · komunitas ${r.community}`,
+    `${padR("skor", 9)} ${r.score}/100 · FOMO ${r.fomo}/100`,
+  ];
+  await send(
+    [
+      `🎯 <b>KANDIDAT LP</b> · ${tokenEmoji(t.symbol)} <b>${esc(t.symbol)}</b> ${verd}`,
+      `<i>lolos screening + tx rame + pool fee 3-5%</i>`,
+      pre(T.join("\n")),
+      r.thesis ? `🧠 <i>${esc(r.thesis)}</i>` : "",
+      r.flags.length ? `🚩 ${esc(r.flags.slice(0, 4).join(" · "))}` : "",
+      `<code>${t.address}</code>`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: `🎯 LP ${t.symbol}`, callback_data: `ca:${t.address}` },
+            { text: "📈 Chart", url: `https://dexscreener.com/robinhood/${t.address}` },
+          ],
+        ],
+      },
+    },
+  );
+}
+
 /** Autonomous LP fired — report the opened position. Skips are logged, not sent. */
 export async function notifyAutoLp(r: AutoLpResult): Promise<void> {
   if (!r.opened || !r.result) return;
@@ -109,10 +150,27 @@ export async function notifyAutoLp(r: AutoLpResult): Promise<void> {
   await send(
     [
       `🤖 <b>AUTO-LP</b> · ${tokenEmoji(r.symbol)} <b>${esc(r.symbol)}</b> #${res.tokenId ?? "?"} ${res.mode === "inrange" ? "🎯" : "🛡"}`,
-      `Otomatis dibuka ${r.sizeEth}Ξ (${res.side})`,
-      `entry MCAP ${fmtMcap(res.entryMcap)} · range tick ${res.tickLower}..${res.tickUpper}`,
-      res.swapHash ? `swap: <a href="${explorerTx(res.swapHash)}">tx</a> · ` : "" + `mint: <a href="${explorerTx(res.txHash)}">tx</a>`,
+      `Otomatis dibuka ${r.sizeEth}Ξ single-side (${esc(res.side ?? "parkir quote asset")})`,
+      `${res.entryMcap ? `entry MCAP ${fmtMcap(res.entryMcap)} · ` : ""}range tick ${res.tickLower}..${res.tickUpper}`,
+      res.swapHash ? `swap: <a href="${explorerTx(res.swapHash)}">tx</a> · mint: <a href="${explorerTx(res.txHash)}">tx</a>` : `mint: <a href="${explorerTx(res.txHash)}">tx</a>`,
       `<i>Cek /list · tutup manual kapan aja</i>`,
+    ].join("\n"),
+  );
+}
+
+/** Auto-manage closed a position (take-profit / stop-loss / out-of-range). */
+export async function notifyAutoClose(i: AutoCloseInfo): Promise<void> {
+  const emo = i.reason === "TP" ? "🎯💰" : i.reason === "SL" ? "🛑" : "🚪";
+  const label = i.reason === "TP" ? "TAKE PROFIT" : i.reason === "SL" ? "STOP LOSS" : "OUT OF RANGE";
+  const pnl =
+    i.pnlPct != null
+      ? `${i.pnlPct >= 0 ? "+" : ""}${i.pnlPct.toFixed(1)}%${i.pnlEth != null ? ` (${i.pnlEth >= 0 ? "+" : ""}${i.pnlEth.toFixed(6)}Ξ)` : ""}`
+      : "—";
+  await send(
+    [
+      `${emo} <b>AUTO-CLOSE · ${label}</b> · ${tokenEmoji(i.sym)} <b>${esc(i.sym)}</b> #${i.tokenId} [${i.version}]`,
+      `PnL: <b>${pnl}</b>`,
+      `<i>ditutup otomatis oleh auto-manage. Cek /list · /ledger</i>`,
     ].join("\n"),
   );
 }

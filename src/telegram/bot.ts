@@ -3,6 +3,10 @@ import { call, send, isOwner, lockOwner } from "./tg.js";
 import { resolveMenu } from "./menu.js";
 import { startWatch } from "./watchLoop.js";
 import { startFeed, stopFeed } from "./feedLoop.js";
+import { startScan, stopScan } from "../radar/scanLoop.js";
+import { startManage, stopManage } from "../radar/automanage.js";
+import { handleHuntCandidate } from "./pipeline.js";
+import { notifyCandidate, notifyAutoClose } from "./notify.js";
 import { wallet } from "../chain/client.js";
 import { cfg } from "../config.js";
 import { logger } from "../util/log.js";
@@ -33,10 +37,14 @@ async function routeCallback(cq: any): Promise<void> {
   if (d === "card") return H.onCard();
   if (d.startsWith("cardp:")) return H.onCardFor(d.slice(6));
   if (d === "swapdo") return H.onSwapDo(mid);
+  if (d === "swap") return H.onSwap("/swap"); // 🔙 back to token menu
+  if (d.startsWith("swf:")) return H.onSwapFrom(d.slice(4), mid); // pick token to sell
+  if (d.startsWith("swp:")) return H.onSwapPct(Number(d.split(":")[1]), mid); // pick % amount
   if (d === "lgrb") return H.onLedgerRebuild(mid);
   if (d.startsWith("lg:")) return H.onLedger(Number(d.split(":")[1]), mid);
   if (d.startsWith("pool:")) return H.onPick(Number(d.split(":")[1]), mid);
   if (d === "ballp") return H.onBalancedLp(mid);
+  if (d === "usdgw") return H.onUseWalletUsdg(mid); // single-side pakai USDG di wallet (no swap/input)
   if (d.startsWith("mint:")) return H.onMint(mid, d.slice(5)); // single|inrange|v4|v4r
   if (d === "mint") return H.onMint(mid, "single");
   if (d === "cancel") {
@@ -76,12 +84,13 @@ async function routeMessage(m: any): Promise<void> {
   if (t === "/list") return H.onList();
   if (t === "/ledger") return H.onLedger(0);
   if (t === "/scan") return H.onScan();
+  if (t.startsWith("/hunt")) return H.onHunt(t.split(/\s+/)[1]);
   if (t === "/card") return H.onCard();
   if (t.startsWith("/swap")) return H.onSwap(t);
   if (t.startsWith("/screen")) return H.onScreen(t.split(/\s+/)[1]);
   if (t.startsWith("/watch")) return H.onWatch(t.split(/\s+/)[1]);
   if (t.startsWith("/feed")) return H.onFeed(t.split(/\s+/)[1]);
-  if (t.startsWith("/auto")) return H.onAuto(t.split(/\s+/)[1]);
+  if (t.startsWith("/auto")) return H.onAuto(t.replace(/^\/auto\s*/i, ""));
   if (t.startsWith("/v4lp")) return H.onV4Lp(t);
   if (t.startsWith("/v4close")) return H.onV4Close(t);
   if (t.startsWith("/v4")) return H.onV4(t.split(/\s+/)[1]);
@@ -116,6 +125,7 @@ async function registerCommands(): Promise<void> {
       { command: "watch", description: "👁 Pemantau lonjakan volume" },
       { command: "scan", description: "🔍 Cek lonjakan volume sekarang" },
       { command: "screen", description: "🧪 Screening GMGN 24h (mcap>500k, vol>1M, no flap)" },
+      { command: "hunt", description: "🎯 Hunter kandidat LP (fee 3-5% + rame + screening)" },
       { command: "card", description: "📸 Kartu profit shareable (portfolio)" },
       { command: "swap", description: "🔄 Swap token via KyberSwap (rute terbaik)" },
       { command: "auto", description: "🤖 Auto-LP (radar → buka otomatis)" },
@@ -132,6 +142,8 @@ async function registerCommands(): Promise<void> {
 export function stop(): void {
   running = false;
   stopFeed();
+  stopScan();
+  stopManage();
 }
 
 export async function run(): Promise<void> {
@@ -139,6 +151,13 @@ export async function run(): Promise<void> {
   log.info(`Robinhood LP Bot v2 jalan — chain ${cfg.chainId}, wallet ${wallet().address}`);
   startWatch();
   void startFeed(); // no-op unless cfg.feed.enabled
+  startScan({
+    onCandidate: (r, p) => {
+      void notifyCandidate(r, p).catch(() => {}); // alert
+      void handleHuntCandidate(r, p).catch(() => {}); // auto-LP if /auto on + gate met
+    },
+  }); // hunter (cfg.scan.enabled)
+  startManage({ onAutoClose: (i) => void notifyAutoClose(i).catch(() => {}) }); // auto-close TP/SL/OOR (gated by cfg.autoLp)
   let offset = 0;
   while (running) {
     try {

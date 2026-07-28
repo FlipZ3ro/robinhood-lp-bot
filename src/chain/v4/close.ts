@@ -14,6 +14,7 @@ import { NATIVE } from "./poolkey.js";
 import { loadV4Deposit } from "./mint.js";
 import { listV4Positions } from "./list.js";
 import { ethUsd } from "../price.js";
+import { kyberSwap, KYBER_NATIVE } from "../kyber.js";
 import { appendLedger } from "../ledger.js";
 import { dataPath, readJson, writeJson } from "../../util/files.js";
 import { logger } from "../../util/log.js";
@@ -84,6 +85,8 @@ export interface V4CloseResult {
   pnlEth: number | null;
   pnlPct: number | null;
   forfeited: string | null; // symbol of a honeypot token forfeited to salvage the ETH side
+  sweepHash?: string | null; // Kyber tx if proceeds were auto-swapped → native ETH
+  sweptEth?: number; // ETH gained from sweeping token/USDG proceeds back to native
 }
 
 export async function closeV4Position(tokenId: string): Promise<V4CloseResult> {
@@ -232,6 +235,32 @@ export async function closeV4Position(tokenId: string): Promise<V4CloseResult> {
   }
 
   dropDeposit(tokenId);
+
+  // ── sweep proceeds → native ETH (like the v3 USDG close) so the wallet returns to CLEAN ETH:
+  //    PnL realizes and native gas tops up, so auto-add never gets stuck holding USDG after a close.
+  //    Swaps ALL non-native currency balances (the volatile token AND USDG) via Kyber. Gated by
+  //    cfg.lp.autoSwapOnClose. Native ETH / WETH are already ETH-equivalent so they're skipped.
+  let sweepHash: string | null = null;
+  let sweptEth = 0;
+  if (cfg.lp.autoSwapOnClose !== false) {
+    for (const [addr, dec] of [[c0, m0.decimals], [c1, m1.decimals]] as const) {
+      const a = addr.toLowerCase();
+      if (a === NATIVE || a === WETH_L) continue; // already ETH-equivalent
+      const raw = await rawBalOf(addr);
+      if (raw <= 0n) continue;
+      try {
+        const k = await Promise.race([kyberSwap(addr, KYBER_NATIVE, raw), new Promise<null>((r) => setTimeout(() => r(null), 60_000))]);
+        if (k?.tx) {
+          sweepHash = k.tx;
+          sweptEth += Number(ethers.formatEther(k.amountOut));
+          log.info(`sweep v4 #${tokenId}: ${STABLES.has(a) ? "USDG" : "token"} ${ethers.formatUnits(raw, dec)} → ${Number(ethers.formatEther(k.amountOut)).toFixed(6)} ETH`);
+        }
+      } catch {
+        /* leave the currency in the wallet if the swap fails (non-fatal) */
+      }
+    }
+  }
+
   log.info(`close v4 #${tokenId} ${m0.symbol}/${m1.symbol}`);
   return {
     txHash,
@@ -247,6 +276,8 @@ export async function closeV4Position(tokenId: string): Promise<V4CloseResult> {
     pnlEth,
     pnlPct,
     forfeited,
+    sweepHash,
+    sweptEth,
   };
 }
 
@@ -286,6 +317,13 @@ async function balOf(addr: string, dec: number): Promise<number> {
   if (addr.toLowerCase() === NATIVE) return Number(ethers.formatEther(await provider.getBalance(w.address)));
   const erc = new ethers.Contract(addr, ["function balanceOf(address) view returns (uint256)"], provider);
   return Number(ethers.formatUnits(await erc.balanceOf!(w.address).catch(() => 0n), dec));
+}
+
+/** Raw ERC-20 balance (for sweeping proceeds → ETH after close). */
+async function rawBalOf(addr: string): Promise<bigint> {
+  const w = wallet();
+  const erc = new ethers.Contract(addr, ["function balanceOf(address) view returns (uint256)"], provider);
+  return erc.balanceOf!(w.address).catch(() => 0n);
 }
 
 function dropDeposit(tokenId: string): void {

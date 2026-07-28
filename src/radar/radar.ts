@@ -14,7 +14,7 @@ const log = logger("radar");
 export interface Candidate {
   token: string;
   symbol: string;
-  source: "feed-new" | "watch-spike";
+  source: "feed-new" | "watch-spike" | "hunt";
   fee?: number;
   wethSeed?: number;
   onchainBackPct?: number; // our buy→sell round-trip sim (100 = clean)

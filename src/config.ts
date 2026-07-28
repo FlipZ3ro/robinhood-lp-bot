@@ -44,6 +44,7 @@ const LpSchema = z.object({
   rangeBufferSpacings: z.number().int().default(2),
   nativeTargetEth: z.number().min(0).default(0.015),
   autoSwapOnClose: z.boolean().default(true),
+  minPoolTvlUsd: z.number().min(0).default(2000), // hide pools below this total liquidity ($) in the LP picker
 });
 
 const WatchSchema = z.object({
@@ -92,7 +93,37 @@ const AutoLpSchema = z.object({
   maxOpen: z.number().int().default(3), // max concurrent LP positions total
   maxPerHour: z.number().int().default(2), // rate limit
   dailyCapEth: z.number().default(0.01), // max ETH auto-deployed per 24h
-  sources: z.array(z.enum(["feed-new", "watch-spike"])).default(["watch-spike"]),
+  sources: z.array(z.enum(["feed-new", "watch-spike", "hunt"])).default(["watch-spike", "hunt"]),
+  // ── auto-CLOSE (manage loop, opt-in per trigger; 0/false = off) ──
+  tpPct: z.number().default(0), // take-profit: close when PnL% ≥ this
+  slPct: z.number().default(0), // stop-loss: close when PnL% ≤ -this
+  closeOor: z.boolean().default(false), // close positions that drift OUT OF RANGE
+  oorGraceMin: z.number().default(30), // wait this long OOR before closing (single-side parks are OOR by design)
+  oorCooldownCount: z.number().int().default(3), // #2 OOR cooldown: after this many OOR-closes, blacklist the token
+  oorCooldownHours: z.number().default(12), // #2 OOR cooldown: ...for this long (stop re-entering a token that never fills)
+  manageSec: z.number().int().positive().default(90), // manage-loop interval (seconds)
+});
+
+// Quality-candidate hunter: poll GMGN trending → screen (thesis + LLM) → keep only tokens that
+// have a v4 pool in the target fee band (3-5%) with real 24h volume → alert with 1-tap LP.
+// Replaces the noisy "every new token/pool" feed spam with focused, farmable candidates.
+const ScanSchema = z.object({
+  enabled: z.boolean().default(true),
+  intervalMin: z.number().int().positive().default(3),
+  feeMinPpm: z.number().int().default(30000), // 3.00%
+  feeMaxPpm: z.number().int().default(50000), // 5.00%
+  minVolUsd: z.number().default(10000), // pool 24h volume floor ("tx rame")
+  minPoolFeesUsd: z.number().default(250), // #1 fee-yield: min 24h fees the pool generated (vol × fee%) — weights busy + HIGH-fee over raw volume
+  minFeeYieldPct: z.number().default(0), // #1 fee-yield: min daily fee/TVL yield % — only enforced when TVL is readable (v4 singleton often reads $0 → skipped)
+  minScore: z.number().default(55), // screening score floor (0-100)
+  cooldownMin: z.number().default(120), // don't re-alert the same token within this window
+  // GMGN trending gates for the hunt — LOOSER than /screen (which targets big tokens), because
+  // the 3-5% high-fee pools live on SMALLER tokens (a JACKET, not a VIRTUAL). These decide which
+  // tokens get to the per-token 3-5%-pool check.
+  screenMinMcap: z.number().default(20000),
+  screenMaxMcap: z.number().default(0), // 0 = no ceiling. Set to farm SMALL-cap pools: for a fixed small position, a smaller pool = bigger fee share = faster fees.
+  screenMinVol: z.number().default(50000),
+  screenMinLiq: z.number().default(3000),
 });
 
 const ConfigSchema = z.object({
@@ -106,6 +137,7 @@ const ConfigSchema = z.object({
   feed: FeedSchema.default({}),
   radar: RadarSchema.default({}),
   autoLp: AutoLpSchema.default({}),
+  scan: ScanSchema.default({}),
   telegramChatId: z.string().optional(),
 });
 
@@ -115,6 +147,7 @@ export type WatchConfig = z.infer<typeof WatchSchema>;
 export type FeedConfig = z.infer<typeof FeedSchema>;
 export type RadarConfig = z.infer<typeof RadarSchema>;
 export type AutoLpConfig = z.infer<typeof AutoLpSchema>;
+export type ScanConfig = z.infer<typeof ScanSchema>;
 
 function load(): Config {
   let raw: unknown;
@@ -154,6 +187,7 @@ export function persist(): void {
     feed: { ...((disk.feed as object) ?? {}), ...cfg.feed },
     radar: { ...((disk.radar as object) ?? {}), ...cfg.radar },
     autoLp: { ...((disk.autoLp as object) ?? {}), ...cfg.autoLp },
+    scan: { ...((disk.scan as object) ?? {}), ...cfg.scan },
     contracts: { ...((disk.contracts as object) ?? {}), ...cfg.contracts },
   };
   writeJson(CONFIG_FILE, merged);

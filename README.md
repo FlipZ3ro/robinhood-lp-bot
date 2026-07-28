@@ -26,16 +26,22 @@ Paste CA → pilih pool → ketik jumlah ETH → posisi kebuka. Sekarang juga.
 
 **Robinhood LP Bot v2** adalah bot liquidity-provider buat **Robinhood Chain** yang dijalanin sepenuhnya dari Telegram. Paste contract address → bot cariin pool paling likuid di **Uniswap v2 / v3 / v4** (termasuk pair **USDG**), beliin token lewat **KyberSwap aggregator** (rute terbaik lintas semua DEX/fee-tier, anti price-impact), terus buka posisi LP. Semua math tick/harga lewat **Uniswap SDK resmi** — nol drift presisi, nggak ada `Math.pow` hand-rolled.
 
-Di atas LP-nya ada layer intelligence:
+Di atas LP-nya ada layer **deteksi + screening**:
 
 - **Scanner volume on-chain** — nyari token yang volumenya lagi *nanjak* (bukan sekadar tinggi).
 - **Feed sequencer Nitro real-time** — deteksi token baru sub-detik, sebelum ke-index DexScreener.
 - **Uji honeypot mandiri** — simulasi beli→jual lewat Quoter, nggak percaya reputasi siapa pun.
 - **Screening GMGN 24 jam** (`/screen`) — filter thesis: mcap > $500k, vol > $1M, no flap.fun, util > meme.
-- **Skoring LLM** (OpenRouter) — verdict `🟢 APE / 🟡 WATCH / 🔴 SKIP` nempel di tiap notif kandidat.
+- **Skoring LLM** (OpenRouter/gateway) — verdict `🟢 APE / 🟡 WATCH / 🔴 SKIP` nempel di tiap notif kandidat.
+
+…dan layer **otomasi farming** (baru):
+
+- **Hunter kandidat** (`/hunt`) — tiap 3 menit scan GMGN trending → screening → cuma lolosin token yang punya **pool fee 3-5% yang rame**, di-rank by **fee-yield** (`vol × fee%`), dalam **band mcap** yang lu set (small-cap = share fee lebih gede buat modal kecil).
+- **Auto-farming** (`/auto`) — auto-**add** kandidat yang lolos gate + auto-**close** by TP / SL / out-of-range. Mode `single` (parkir quote asset, rug-safe) atau `inrange` (both-sided, fee langsung) — bisa diganti live.
+- **Reuse USDG + sweep balik ETH** — kalau udah ada USDG di wallet, gak swap ulang; tiap close proceeds otomatis di-sweep balik jadi ETH (wallet balik bersih, gas ke-top-up).
 - **Kartu profit shareable** — tiap close auto-generate PNG flex (STRIX aesthetic).
 
-Ditulis TypeScript modular, **owner-only auth**, slippage floor di semua swap, atomic ledger write, graceful shutdown, single-instance lock. Jalan di laptop atau VPS 24 jam.
+Ditulis TypeScript modular, **owner-only auth**, slippage floor di semua swap, atomic ledger write, graceful shutdown, single-instance lock, **serialize tx satu-per-satu** (anti nonce-collision). Jalan di laptop atau VPS 24 jam.
 
 ---
 
@@ -178,6 +184,8 @@ Buka bot lu di Telegram, kirim `/start`. Kalau dia jawab, beres.
 
 Uniswap nggak bisa bikin range yang nyebrang harga cuma dengan satu token. Jadi "in-range" artinya bot **beliin tokennya duluan** (lewat KyberSwap aggregator → rute termurah, bukan di pool fee-tinggi yang lu pilih). Pakai buat token yang pool-nya tebel. Token meragukan → tetep single-side.
 
+> **Pair USDG:** sama persis, cuma quote asset-nya USDG (bukan ETH). Single-side USDG = parkir **USDG doang** (rug-safe). Kalau udah ada USDG di wallet, muncul tombol **💵 pakai USDG wallet ($X)** — buka posisi langsung dari USDG itu, **tanpa input jumlah, tanpa swap**. USDG yang udah ada juga otomatis di-**reuse** (gak beli 2×; cuma beli kekurangannya). Buat in-range v4 (yang gak refund kelebihan kayak v3), sisa yang gak kepakai di-**sweep balik ke ETH** biar wallet gak numpuk dust.
+
 ### Cek posisi — `/list`
 
 ```
@@ -280,6 +288,32 @@ GMGN (opsional, enrich): install `gmgn-cli` + config di mesin yang jalanin bot (
 
 ---
 
+## Auto-farming — hunter + auto-add + auto-close (`/hunt` · `/auto`)
+
+Layer paling atas: bot **cariin, buka, dan tutup posisi sendiri** — lu tinggal set gate-nya.
+
+**1. Hunter (`/hunt`)** — tiap 3 menit: `100 trending → screening (thesis + LLM) → cuma yang punya pool fee 3-5% RAME → kandidat`. Gate kualitasnya (semua tunable via `/set`):
+
+- **Fee-yield** — pool di-rank by fee yang beneran dihasilkan (`vol24h × fee%`), bukan volume mentah. Pool 5% @ $8k vol menang dari 3% @ $9k.
+- **Band mcap** — cuma token di rentang mcap yang lu mau. Small-cap = modal kecil lu jadi **share fee lebih gede**.
+- **OOR cooldown** — token yang kebuka-tutup out-of-range terus (gak pernah masuk range) di-blacklist sementara → stop buang gas.
+
+**2. Auto-add** — kandidat lolos gate + verdict (`requireAction` ≥ `watch`, skor ≥ `alpscore`) dibuka otomatis. Gate berlapis: source, LLM verdict, GMGN honeypot/tax, likuiditas, **1 token = 1 posisi** (anti dobel), cap concurrent/jam/harian, saldo. Mode:
+
+| | `single` (rug-safe) | `inrange` (agresif) |
+|---|---|---|
+| Isi posisi | parkir quote asset (USDG/ETH) doang | both-sided (beli token juga) |
+| Fee | jalan pas harga **MASUK** range | jalan **LANGSUNG** |
+| Kalau rug | aman (0 token) | pegang token → rugi |
+
+`/set alpmode single` atau `/set alpmode inrange` — live, tanpa restart.
+
+**3. Auto-close** — manage loop cek tiap 90 detik: **TP** (PnL ≥ `alptp`%) · **SL** (PnL ≤ −`alpsl`%) · **OOR** (keluar range > `alpgrace` menit). PnL dihitung **LP-vs-HODL** (fee + IL, konsisten sama yang di-realize pas close), bukan budget kotor. Tiap close → **sweep proceeds → ETH** otomatis (token + USDG dijual balik), wallet bersih + gas ke-isi.
+
+> ⚠️ **Pakai dana REAL tanpa konfirmasi manusia.** OFF by default (`/auto on` buat nyalain). Semua cap konservatif; naikin sadar-sadar via `/set alp*`. Wallet-tx di-serialize (satu sekuens per waktu) biar gak nonce-collision.
+
+---
+
 ## Semua command
 
 | Command | Fungsi |
@@ -294,26 +328,38 @@ GMGN (opsional, enrich): install `gmgn-cli` + config di mesin yang jalanin bot (
 | `/watch` | Status scanner + volume tertinggi saat ini |
 | `/feed` | Monitor sequencer real-time · `/feed on`/`off` |
 | `/scan` | Cek volume sekarang juga (manual) |
-| `/auto` | Auto-LP (radar → buka posisi otomatis) |
+| `/hunt` | Hunter kandidat LP (fee 3-5% + tx rame + screening) |
+| `/auto` | Auto-farming: auto-add + auto-close · `/auto on`\|`off` · `/auto tp 100` · `/auto sl 30` · `/auto oor on`\|`off` |
 | `/v4` | Cek pool Uniswap v4 sebuah token CA |
 | `/closeall` | Tutup SEMUA posisi |
 | `/sell` | Jual semua token nyangkut → ETH |
 | `/wallet` | Saldo hot wallet |
 | `/settings` · `/set <key> <angka>` | Lihat / ubah setting |
 
-**Setting yang bisa diubah:**
+**Setting yang bisa diubah** (semua live, `/set` langsung apply tanpa restart):
 ```
-LP     : /set width 50        lebar range (%)
-         /set slippage 5      toleransi slippage (%)
-         /set gastarget 0.015 gas native yang dijaga tiap close
+LP     : /set width 50 · /set slippage 5 · /set gastarget 0.015
 
-Scanner: /set vol5m 500000    volume 5m minimal (USD)
-         /set rise 1.4        harus naik berapa kali lipat
-         /set liq 50000       likuiditas pool minimal
-         /set tax 6           tolak token dengan tax > sekian %
-         /set cooldown 60     jeda notif per token (menit)
-         /set interval 120    scan tiap berapa detik
+Scanner: /set vol5m 500000 · /set rise 1.4 · /set liq 50000 · /set tax 6
+         /set cooldown 60 · /set interval 120
 
+Hunter : /set huntvol 15000       volume pool 24h minimal (USD)
+         /set huntfees 400        fee 24h pool minimal = vol × fee% (fee-yield)
+         /set huntyield 0         fee/TVL yield harian minimal % (0 = off, TVL v4 sering ke-baca $0)
+         /set huntscore 55        skor screening minimal
+         /set huntmcapmin 100000  ·  /set huntmcapmax 5000000   band mcap (max 0 = tanpa batas)
+
+Auto-LP: /set alpmode single|inrange   single (rug-safe) / inrange (fee langsung)
+         /set alpsize 0.0025      ETH per posisi
+         /set alpscore 60         skor minimal buat AUTO-add (beda dari huntscore)
+         /set alpmaxopen 5        max posisi barengan
+         /set alpperhour 4        ·  /set alpdaily 0.2         cap open/jam & ETH/hari
+         /set alpminliq 1000      likuiditas minimal (0 = andelin fee-gate; berguna buat small-cap v4)
+         /set alpgrace 30         menit OOR sebelum auto-close
+         /set alpclose 1          toggle auto-close OOR (0/1)
+         /set alpoorcount 3  ·  /set alpoorhours 12   OOR cooldown: N× OOR → blacklist X jam
+
+Auto-close (via /auto): /auto tp 100  ·  /auto sl 30  ·  /auto oor on|off
 Feed   : /set newtoken 1 · /set posmon 1 · /set autoclose 0 · /set minseed 0.02
 Radar  : /set radar 1 · /set gmgn 1
 ```
@@ -347,16 +393,19 @@ src/
 ├── chain/                semua urusan blockchain
 │   ├── client.ts         provider (LP + watch), wallet, gas, fast-submit routing
 │   ├── kyber.ts          KyberSwap aggregator (quote + build, 4 security gate)
-│   ├── positions.ts      v3 open / list / close (Uniswap SDK math)
+│   ├── positions.ts      v3 open / list / close + USDG single-side & in-range (Uniswap SDK math)
 │   ├── pools.ts          findPools, poolState, range math (SDK)
 │   ├── swaps.ts          quote + swap v3 (slippage floor)
+│   ├── candidate.ts      qualifyCandidate — pool 3-5% + fee-yield gate (hunter)
+│   ├── dexscreener.ts    volume/liq pool (cached) — sinyal fee-farming
+│   ├── txlock.ts         serialize tx wallet (anti nonce-collision)
 │   ├── ledger.ts         ledger permanen + rebuild on-chain
 │   ├── analytics.ts      PnL seumur hidup
 │   ├── tokens.ts         metadata token (cached) + SDK Token
 │   ├── price.ts          ETH/USD multi-source
 │   ├── blockscout.ts     helper REST Blockscout + mapLimit
 │   ├── v2/               Uniswap v2 — pair.ts · mint.ts (zap) · list.ts · close.ts
-│   └── v4/               Uniswap v4 — discover · mint · list · close · backfill (archive PnL)
+│   └── v4/               Uniswap v4 — discover · mint (single/in-range + reuse USDG) · list (PnL LP-vs-HODL) · close (sweep→ETH) · backfill
 ├── telegram/
 │   ├── tg.ts             transport + AUTH boundary (owner-only)
 │   ├── bot.ts            long-poll loop + routing + setMyCommands
@@ -369,8 +418,12 @@ src/
 │   └── format.ts         escape, padding, emoji per-token
 ├── feed/                 monitor sequencer real-time (Nitro)
 │   ├── decode · listener (WS + IP-pin) · swapdecode · lpdecode · monitor
-├── radar/                konfirmasi kandidat (LLM + GMGN)
-│   ├── openrouter.ts · gmgn.ts · screen.ts (/screen thesis) · radar.ts
+├── radar/                screening + auto-farming
+│   ├── openrouter.ts · gmgn.ts · screen.ts (/screen thesis) · radar.ts (verdict LLM+GMGN)
+│   ├── scanLoop.ts       hunter (/hunt) — trending → screen → kandidat 3-5%
+│   ├── autolp.ts         auto-add: gate chain + open (dedup 1 token/posisi + txlock)
+│   ├── automanage.ts     auto-close TP/SL/OOR (grace restart-proof)
+│   └── oorcool.ts        OOR cooldown (blacklist token yang gak pernah masuk range)
 ├── watch/scanner.ts      scan volume + uji honeypot on-chain
 └── util/                 log, atomic file write + lock, formatter
 ```
@@ -392,7 +445,11 @@ Ditulis atomik (temp + rename), jadi crash di tengah nulis nggak bikin ledger ko
 
 **Tes honeypot nangkep honeypot & tax — BUKAN rug.** Dev yang tarik likuiditas besok tetep lolos tes hari ini. Nggak ada tes yang bisa liat masa depan.
 
-**Single-side ETH itu rem alami lu.** Mode in-range ngelepas rem itu. Pilih sadar.
+**Single-side itu rem alami lu.** Mode in-range ngelepas rem itu (lu pegang token → kena rug). Pilih sadar.
+
+**Auto-farming pakai dana REAL, tanpa nanya.** `/auto on` bikin bot buka + tutup posisi sendiri pakai duit lu. OFF by default, cap konservatif — tapi lu yang set, naikin sadar-sadar.
+
+**PnL di `/list` = LP-vs-HODL** (fee + impermanent loss), bukan perubahan absolut wallet. Ini ngukur performa LP-nya (fee vs IL), konsisten sama yang di-realize pas close. Gerakan harga token = risiko pasar terpisah.
 
 **Pakai burner wallet.** Private key-nya duduk di `.env` dalam bentuk teks biasa. Jangan taruh duit yang lu nggak siap ilang.
 

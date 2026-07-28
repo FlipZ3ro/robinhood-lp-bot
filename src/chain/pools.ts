@@ -20,6 +20,10 @@ import type { PoolInfo, MintMode } from "../types.js";
 
 const LN_10001 = Math.log(1.0001);
 
+/** Robinhood Chain stablecoin. Some tokens keep their v3 liquidity in token/USDG, not token/WETH. */
+export const USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+const USDG_DECIMALS = 6;
+
 /** All WETH-paired pools for a token that actually have liquidity, ranked by depth. */
 export async function findPools(tokenAddr: string): Promise<PoolInfo[]> {
   const token = ethers.getAddress(tokenAddr);
@@ -44,6 +48,39 @@ export async function findPools(tokenAddr: string): Promise<PoolInfo[]> {
     });
   }
   out.sort((a, b) => b.wethInPool - a.wethInPool);
+  return out;
+}
+
+/**
+ * All token/USDG v3 pools with liquidity. The WETH-only `findPools` misses these — some tokens
+ * (e.g. JACKET) keep their real v3 liquidity in a token/USDG pool, so without this the bot shows
+ * "0 v3" for a token that actually has a live, deep v3 pool. Ranked by USDG depth.
+ */
+export async function findUsdgPools(tokenAddr: string): Promise<PoolInfo[]> {
+  const token = ethers.getAddress(tokenAddr);
+  const usdg = ethers.getAddress(USDG);
+  if (token.toLowerCase() === usdg.toLowerCase()) return [];
+  const factory = new ethers.Contract(C.factory, FACTORY_ABI, provider);
+  const uc = new ethers.Contract(usdg, ERC20_ABI, provider);
+  const out: PoolInfo[] = [];
+  for (const fee of cfg.lp.feeTiers) {
+    const pool: string = await factory.getPool!(token, usdg, fee).catch(() => ethers.ZeroAddress);
+    if (pool === ethers.ZeroAddress) continue;
+    const pc = new ethers.Contract(pool, POOL_ABI, provider);
+    const [liq, t0] = await Promise.all([pc.liquidity!(), pc.token0!()]);
+    if (liq === 0n) continue;
+    const ubal: bigint = await uc.balanceOf!(pool).catch(() => 0n);
+    out.push({
+      pool,
+      fee,
+      liquidity: liq,
+      token0: ethers.getAddress(t0),
+      wethInPool: 0,
+      quote: "usd",
+      usdgInPool: Number(ethers.formatUnits(ubal, USDG_DECIMALS)),
+    });
+  }
+  out.sort((a, b) => (b.usdgInPool ?? 0) - (a.usdgInPool ?? 0));
   return out;
 }
 

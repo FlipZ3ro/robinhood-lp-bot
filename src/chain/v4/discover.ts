@@ -34,6 +34,28 @@ function stateView(): ethers.Contract {
   return new ethers.Contract(C.v4StateView, STATEVIEW_ABI, provider);
 }
 
+// Last-good discovery cache. Blockscout getLogs is flaky and intermittently returns empty, which
+// makes live pools VANISH from the picker mid-session ("kadang ke-load, kadang enggak"). Once a
+// token's pools are discovered we keep serving them until a later successful scan refreshes the set
+// — v4 pools persist on-chain, so a frozen set is never wrong, only slightly stale on `liquidity`.
+const v4EthCache = new Map<string, V4Pool[]>();
+const v4UsdCache = new Map<string, V4Pool[]>();
+
+/** Blockscout getLogs with retry — transient empties/timeouts otherwise wipe the pool list. */
+async function getLogsItems(url: string, tries = 3): Promise<any[]> {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r: any = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((x) => x.json());
+      const items = Array.isArray(r?.result) ? r.result : [];
+      if (items.length) return items;
+    } catch {
+      /* retry */
+    }
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+  }
+  return [];
+}
+
 /** Verify PoolKeys are live (price > 0) and return them with liquidity. Bounded concurrency
  * so a token with 100+ pools doesn't flood the RPC. */
 async function verify(sv: ethers.Contract, keys: Array<{ pk: PoolKey; poolId: string }>, quote: "eth" | "usd" = "eth"): Promise<V4Pool[]> {
@@ -71,13 +93,7 @@ export async function discoverV4Pools(token: string): Promise<V4Pool[]> {
   // Initialize events where currency1 = token. Native-ETH pools sort native (0x0) to
   // currency0, so the token is always currency1 for the pools we LP into.
   const url = `${blockscout}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${pm}&topic0=${INITIALIZE_TOPIC}&topic3=${tokTopic}&topic0_3_opr=and`;
-  let items: any[] = [];
-  try {
-    const r: any = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((x) => x.json());
-    items = Array.isArray(r?.result) ? r.result : [];
-  } catch {
-    /* fall through to probe */
-  }
+  const items = await getLogsItems(url);
 
   if (items.length) {
     const seen = new Set<string>();
@@ -105,10 +121,16 @@ export async function discoverV4Pools(token: string): Promise<V4Pool[]> {
     }
     // cap at the 120 most-recent pools so a pathological token can't stall discovery
     const pools = await verify(sv, keys.slice(-120));
-    if (pools.length) return pools;
+    if (pools.length) {
+      v4EthCache.set(t.toLowerCase(), pools);
+      return pools;
+    }
   }
 
-  // Fallback: probe the common fee tiers (if the event query failed / returned nothing)
+  // Blockscout event query failed / empty → serve the last-good cache before falling back to a thin
+  // fixed-tier probe (which would drop most real pools).
+  const cached = v4EthCache.get(t.toLowerCase());
+  if (cached?.length) return cached;
   const probeKeys = V4_FEE_TIERS.map((fee) => {
     const pk = ethPoolKey(t, fee);
     return { pk, poolId: computePoolId(pk) };
@@ -129,13 +151,7 @@ export async function discoverV4UsdgPools(token: string): Promise<V4Pool[]> {
   const keys: Array<{ pk: PoolKey; poolId: string }> = [];
   for (const [pos, opr] of [["topic2", "topic0_2_opr"], ["topic3", "topic0_3_opr"]] as const) {
     const url = `${blockscout}/api?module=logs&action=getLogs&fromBlock=0&toBlock=latest&address=${pm}&topic0=${INITIALIZE_TOPIC}&${pos}=${tk}&${opr}=and`;
-    let items: any[] = [];
-    try {
-      const r: any = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((x) => x.json());
-      items = Array.isArray(r?.result) ? r.result : [];
-    } catch {
-      continue;
-    }
+    const items = await getLogsItems(url);
     for (const lg of items) {
       try {
         const c0 = ("0x" + lg.topics[2].slice(26)).toLowerCase();
@@ -156,7 +172,12 @@ export async function discoverV4UsdgPools(token: string): Promise<V4Pool[]> {
       }
     }
   }
-  return verify(sv, keys.slice(-120), "usd");
+  const pools = await verify(sv, keys.slice(-120), "usd");
+  if (pools.length) {
+    v4UsdCache.set(tL, pools);
+    return pools;
+  }
+  return v4UsdCache.get(tL) ?? pools; // Blockscout hiccup → last-good discovery (don't vanish)
 }
 
 /**

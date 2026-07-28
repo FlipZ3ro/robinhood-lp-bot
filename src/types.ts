@@ -2,13 +2,15 @@
 
 export type MintMode = "single" | "inrange";
 
-/** A WETH-paired pool discovered for a token. */
+/** A pool discovered for a token (WETH-paired by default; USDG-paired when quote==="usd"). */
 export interface PoolInfo {
   pool: string;
   fee: number;
   liquidity: bigint;
   token0: string;
-  wethInPool: number; // proxy TVL for ranking
+  wethInPool: number; // proxy TVL for ranking (ETH units; 0 for USDG pools)
+  quote?: "eth" | "usd"; // "usd" = token/USDG pair (no WETH leg); default "eth"
+  usdgInPool?: number; // USDG-side balance for quote==="usd" (display + ranking)
 }
 
 /** Token metadata (cached). */
@@ -56,6 +58,8 @@ export interface PositionRow {
   token0: string;
   token1: string;
   tokenSym: string;
+  pair?: string; // display pair for non-WETH positions, e.g. "JACKET/USDG"
+  quote?: "eth" | "usd"; // "usd" = valued against USDG (stable); default eth
   fee: number;
   inRange: boolean;
   tick: number;

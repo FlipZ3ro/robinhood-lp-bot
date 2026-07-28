@@ -26,16 +26,22 @@ Paste a CA → pick a pool → type an ETH amount → position opened. Right now
 
 **Robinhood LP Bot v2** is a liquidity-provider bot for **Robinhood Chain**, driven entirely from Telegram. Paste a contract address → the bot finds the deepest pool across **Uniswap v2 / v3 / v4** (including **USDG** pairs), buys the token through the **KyberSwap aggregator** (best route across every DEX/fee-tier, minimal price impact), then opens an LP position. All tick/price math goes through the **official Uniswap SDK** — zero precision drift, no hand-rolled `Math.pow`.
 
-On top of the LP sits an intelligence layer:
+On top of the LP sits a **detection + screening** layer:
 
 - **On-chain volume scanner** — finds tokens whose volume is *rising*, not merely high.
 - **Real-time Nitro sequencer feed** — sub-second new-token detection, before DexScreener indexes it.
 - **Self-run honeypot test** — simulates buy→sell via the Quoter; trusts no one's reputation.
 - **GMGN 24h screening** (`/screen`) — thesis filter: mcap > $500k, vol > $1M, no flap.fun, utility over meme.
-- **LLM scoring** (OpenRouter) — a `🟢 APE / 🟡 WATCH / 🔴 SKIP` verdict attached to every candidate alert.
+- **LLM scoring** (OpenRouter/gateway) — a `🟢 APE / 🟡 WATCH / 🔴 SKIP` verdict attached to every candidate alert.
+
+…and an **automated farming** layer (new):
+
+- **Candidate hunter** (`/hunt`) — every 3 min: scan GMGN trending → screen → keep only tokens that have a **busy 3-5% fee pool**, ranked by **fee-yield** (`vol × fee%`), inside a **market-cap band** you set (small-cap = bigger fee share for small capital).
+- **Auto-farming** (`/auto`) — auto-**add** candidates that clear the gate + auto-**close** by TP / SL / out-of-range. Mode `single` (park the quote asset, rug-safe) or `inrange` (both-sided, fee immediately) — switchable live.
+- **Reuse USDG + sweep back to ETH** — if you already hold USDG it isn't re-swapped; every close sweeps proceeds back to ETH (wallet stays clean, gas tops up).
 - **Shareable profit cards** — every close auto-generates a flex PNG (STRIX aesthetic).
 
-Written in modular TypeScript with **owner-only auth**, a slippage floor on every swap, atomic ledger writes, graceful shutdown, and a single-instance lock. Runs on a laptop or a 24/7 VPS.
+Written in modular TypeScript with **owner-only auth**, a slippage floor on every swap, atomic ledger writes, graceful shutdown, a single-instance lock, and **serialized wallet transactions** (no nonce collisions). Runs on a laptop or a 24/7 VPS.
 
 ---
 
@@ -280,6 +286,32 @@ GMGN (optional enrichment): install `gmgn-cli` + config on the machine running t
 
 ---
 
+## Auto-farming — hunter + auto-add + auto-close (`/hunt` · `/auto`)
+
+The top layer: the bot **finds, opens, and closes positions on its own** — you just set the gates.
+
+**1. Hunter (`/hunt`)** — every 3 min: `100 trending → screening (thesis + LLM) → only tokens with a BUSY 3-5% fee pool → candidates`. Quality gates (all tunable via `/set`):
+
+- **Fee-yield** — pools are ranked by the fees they actually generate (`vol24h × fee%`), not raw volume. A 5% pool @ $8k vol beats a 3% pool @ $9k.
+- **Market-cap band** — only tokens in the range you want. Small-cap = your small position is a **bigger share of fees**.
+- **OOR cooldown** — a token that keeps opening/closing out-of-range (never fills) gets temporarily blacklisted → stop burning gas.
+
+**2. Auto-add** — candidates that clear the gate + verdict (`requireAction` ≥ `watch`, score ≥ `alpscore`) are opened automatically. Layered gates: source, LLM verdict, GMGN honeypot/tax, liquidity, **1 token = 1 position** (no dupes), concurrent/hourly/daily caps, balance. Mode:
+
+| | `single` (rug-safe) | `inrange` (aggressive) |
+|---|---|---|
+| Position | parks the quote asset (USDG/ETH) only | both-sided (buys the token too) |
+| Fee | starts when price **enters** range | starts **immediately** |
+| On rug | safe (0 token) | holds the token → loss |
+
+`/set alpmode single` or `/set alpmode inrange` — live, no restart.
+
+**3. Auto-close** — the manage loop checks every 90s: **TP** (PnL ≥ `alptp`%) · **SL** (PnL ≤ −`alpsl`%) · **OOR** (out of range > `alpgrace` min). PnL is measured **LP-vs-HODL** (fees + IL, consistent with what you realize at close), not the gross budget. Every close **sweeps proceeds → ETH** (token + USDG sold back), wallet clean + gas refilled.
+
+> ⚠️ **Spends REAL funds with no human confirmation.** OFF by default (`/auto on` to enable). Caps are conservative; raise them deliberately via `/set alp*`. Wallet transactions are serialized (one sequence at a time) to avoid nonce collisions.
+
+---
+
 ## All commands
 
 | Command | Function |
@@ -294,26 +326,38 @@ GMGN (optional enrichment): install `gmgn-cli` + config on the machine running t
 | `/watch` | Scanner status + current top volume |
 | `/feed` | Real-time sequencer monitor · `/feed on`/`off` |
 | `/scan` | Check volume right now (manual) |
-| `/auto` | Auto-LP (radar → opens positions automatically) |
+| `/hunt` | Candidate hunter (fee 3-5% + busy tx + screening) |
+| `/auto` | Auto-farming: auto-add + auto-close · `/auto on`\|`off` · `/auto tp 100` · `/auto sl 30` · `/auto oor on`\|`off` |
 | `/v4` | Inspect a token's Uniswap v4 pools by CA |
 | `/closeall` | Close ALL positions |
 | `/sell` | Sell all stuck tokens → ETH |
 | `/wallet` | Hot-wallet balance |
 | `/settings` · `/set <key> <value>` | View / change settings |
 
-**Adjustable settings:**
+**Adjustable settings** (all live — `/set` applies immediately, no restart):
 ```
-LP      : /set width 50        range width (%)
-          /set slippage 5      slippage tolerance (%)
-          /set gastarget 0.015 native gas kept after each close
+LP      : /set width 50 · /set slippage 5 · /set gastarget 0.015
 
-Scanner : /set vol5m 500000    minimum 5m volume (USD)
-          /set rise 1.4        required rise multiplier
-          /set liq 50000       minimum pool liquidity
-          /set tax 6           reject tokens with tax > n%
-          /set cooldown 60     per-token alert cooldown (min)
-          /set interval 120    scan interval (seconds)
+Scanner : /set vol5m 500000 · /set rise 1.4 · /set liq 50000 · /set tax 6
+          /set cooldown 60 · /set interval 120
 
+Hunter  : /set huntvol 15000       min pool 24h volume (USD)
+          /set huntfees 400        min pool 24h fees = vol × fee% (fee-yield)
+          /set huntyield 0         min daily fee/TVL yield % (0 = off; v4 TVL often reads $0)
+          /set huntscore 55        min screening score
+          /set huntmcapmin 100000  ·  /set huntmcapmax 5000000   mcap band (max 0 = no ceiling)
+
+Auto-LP : /set alpmode single|inrange   single (rug-safe) / inrange (fee immediately)
+          /set alpsize 0.0025      ETH per position
+          /set alpscore 60         min score to AUTO-add (separate from huntscore)
+          /set alpmaxopen 5        max concurrent positions
+          /set alpperhour 4        ·  /set alpdaily 0.2          open/hour & ETH/day caps
+          /set alpminliq 1000      min liquidity (0 = rely on fee-gate; useful for small-cap v4)
+          /set alpgrace 30         minutes OOR before auto-close
+          /set alpclose 1          toggle auto-close OOR (0/1)
+          /set alpoorcount 3  ·  /set alpoorhours 12   OOR cooldown: N× OOR → blacklist X h
+
+Auto-close (via /auto): /auto tp 100  ·  /auto sl 30  ·  /auto oor on|off
 Feed    : /set newtoken 1 · /set posmon 1 · /set autoclose 0 · /set minseed 0.02
 Radar   : /set radar 1 · /set gmgn 1
 ```
@@ -347,16 +391,19 @@ src/
 ├── chain/                everything blockchain
 │   ├── client.ts         providers (LP + watch), wallet, gas, fast-submit routing
 │   ├── kyber.ts          KyberSwap aggregator (quote + build, 4 security gates)
-│   ├── positions.ts      v3 open / list / close (Uniswap SDK math)
+│   ├── positions.ts      v3 open / list / close + USDG single-side & in-range (Uniswap SDK math)
 │   ├── pools.ts          findPools, poolState, range math (SDK)
 │   ├── swaps.ts          quote + swap v3 (slippage floor)
+│   ├── candidate.ts      qualifyCandidate — 3-5% pool + fee-yield gate (hunter)
+│   ├── dexscreener.ts    pool volume/liquidity (cached) — fee-farming signal
+│   ├── txlock.ts         wallet-tx serializer (no nonce collisions)
 │   ├── ledger.ts         permanent ledger + on-chain rebuild
 │   ├── analytics.ts      lifetime PnL
 │   ├── tokens.ts         token metadata (cached) + SDK Token
 │   ├── price.ts          ETH/USD multi-source
 │   ├── blockscout.ts     Blockscout REST helper + mapLimit
 │   ├── v2/               Uniswap v2 — pair.ts · mint.ts (zap) · list.ts · close.ts
-│   └── v4/               Uniswap v4 — discover · mint · list · close · backfill (archive PnL)
+│   └── v4/               Uniswap v4 — discover · mint (single/in-range + reuse USDG) · list (LP-vs-HODL PnL) · close (sweep→ETH) · backfill
 ├── telegram/
 │   ├── tg.ts             transport + AUTH boundary (owner-only)
 │   ├── bot.ts            long-poll loop + routing + setMyCommands
@@ -369,8 +416,12 @@ src/
 │   └── format.ts         escape, padding, per-token emoji
 ├── feed/                 real-time sequencer monitor (Nitro)
 │   ├── decode · listener (WS + IP-pin) · swapdecode · lpdecode · monitor
-├── radar/                candidate confirmation (LLM + GMGN)
-│   ├── openrouter.ts · gmgn.ts · screen.ts (/screen thesis) · radar.ts
+├── radar/                screening + auto-farming
+│   ├── openrouter.ts · gmgn.ts · screen.ts (/screen thesis) · radar.ts (LLM+GMGN verdict)
+│   ├── scanLoop.ts       hunter (/hunt) — trending → screen → 3-5% candidates
+│   ├── autolp.ts         auto-add: gate chain + open (1 token/position dedup + txlock)
+│   ├── automanage.ts     auto-close TP/SL/OOR (restart-proof grace)
+│   └── oorcool.ts        OOR cooldown (blacklist tokens that never enter range)
 ├── watch/scanner.ts      volume scan + on-chain honeypot test
 └── util/                 log, atomic file write + lock, formatters
 ```
@@ -392,7 +443,11 @@ Writes are atomic (temp + rename), so a crash mid-write won't corrupt the ledger
 
 **The honeypot test catches honeypots & tax — NOT rugs.** A dev who pulls liquidity tomorrow still passes today's test. No test can see the future.
 
-**Single-side ETH is your natural brake.** In-range mode releases that brake. Choose consciously.
+**Single-side is your natural brake.** In-range mode releases that brake (you hold the token → exposed to rugs). Choose consciously.
+
+**Auto-farming spends REAL funds, no questions asked.** `/auto on` lets the bot open + close positions with your money. OFF by default, conservative caps — but you set them, so raise them deliberately.
+
+**PnL in `/list` = LP-vs-HODL** (fees + impermanent loss), not your absolute wallet change. It measures how the LP itself performs (fees vs IL), consistent with what you realize at close. The token's directional price move is separate market risk.
 
 **Use a burner wallet.** The private key sits in `.env` in plaintext. Don't put in money you're not ready to lose.
 

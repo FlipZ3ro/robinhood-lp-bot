@@ -44,6 +44,7 @@ export interface V4Row {
   depEth: number | null;
   ethPaired: boolean; // true if one side is native ETH (bot-manageable close)
   ageMs: number | null;
+  tokenAddr: string; // the volatile (non-ETH/non-USDG) side — for OOR-cooldown keying
 }
 
 const signed24 = (v: number): number => (v >= 0x800000 ? v - 0x1000000 : v);
@@ -253,11 +254,28 @@ export async function listV4Positions(): Promise<V4Row[]> {
       const feeUsd = sideUsd(fee0, u0, u1) + sideUsd(fee1, u1, u0);
 
       const ethPaired = c0.toLowerCase() === NATIVE || c1.toLowerCase() === NATIVE;
+      const isQuote = (a: string) => a === NATIVE || a === WETH_L || STABLES.has(a);
+      const tokenAddr = isQuote(c0.toLowerCase()) ? c1 : c0; // volatile side (non-ETH/non-USDG)
       const dep = deps[tokenId];
       // age: bot deposit ts, else the position's on-chain mint time (manual web adds)
       const openedAt = dep?.ts ?? dep?.mintTs ?? (await v4MintTs(tokenId).catch(() => null));
       // primary token = the non-stable / non-eth side (for the emoji/label)
       const primary = u0 != null && u1 == null ? m1.symbol : u1 != null && u0 == null ? m0.symbol : m0.symbol;
+
+      // PnL basis = LP-vs-HODL (SAME as closeV4Position's ledger): value the DEPOSITED amounts
+      // (dep0/dep1) at the CURRENT price. The old basis (gross ETH budget = depositWei) wrongly
+      // counted the entry swap-fee + the leftover swept BACK to the wallet as "loss", so /list showed
+      // a phantom minus that disagreed with the realized close PnL. Now they match.
+      let basisEth = dep?.depositWei ? Number(ethers.formatEther(dep.depositWei)) : null;
+      const depAmts = dep as { dep0?: string; dep1?: string } | undefined;
+      if (depAmts?.dep0 && depAmts?.dep1 && px > 0) {
+        try {
+          const hodlUsd = sideUsd(CurrencyAmount.fromRawAmount(cur0, depAmts.dep0), u0, u1) + sideUsd(CurrencyAmount.fromRawAmount(cur1, depAmts.dep1), u1, u0);
+          if (hodlUsd > 0) basisEth = hodlUsd / px;
+        } catch {
+          /* keep gross-budget basis on a valuation edge */
+        }
+      }
 
       return {
         tokenId,
@@ -274,9 +292,10 @@ export async function listV4Positions(): Promise<V4Row[]> {
         sym1: m1.symbol,
         feeUsd,
         valueUsd,
-        depEth: dep?.depositWei ? Number(ethers.formatEther(dep.depositWei)) : null,
+        depEth: basisEth,
         ethPaired,
         ageMs: openedAt ? Date.now() - openedAt : null,
+        tokenAddr: ethers.getAddress(tokenAddr),
       };
     } catch (e) {
       log.warn(`skip v4 #${tokenId}: ${(e as Error).message.slice(0, 80)}`);

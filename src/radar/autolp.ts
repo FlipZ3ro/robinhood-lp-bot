@@ -10,14 +10,28 @@ import { cfg } from "../config.js";
 import { findPools, pickLpPool } from "../chain/pools.js";
 import { openPosition, listPositions } from "../chain/positions.js";
 import { balances } from "../chain/holdings.js";
+import { acquireWallet, releaseWallet } from "../chain/txlock.js";
+import { inOorCooldown, oorCooldownLeftMin } from "./oorcool.js";
 import { dataPath, readJson, writeJson } from "../util/files.js";
 import { logger } from "../util/log.js";
 import type { Candidate, Verdict } from "./radar.js";
-import type { OpenResult } from "../types.js";
 
 const log = logger("autolp");
 const STATE_FILE = dataPath("autolp-state.json");
 const GAS_RESERVE = 0.0004;
+
+// Common shape of a v3 OpenResult and a v4 V4OpenResult, so auto-open can return either.
+type OpenLike = {
+  tokenId: string | null;
+  txHash: string;
+  tickLower: number;
+  tickUpper: number;
+  depositEth?: string;
+  mode?: string;
+  side?: string;
+  entryMcap?: number;
+  swapHash?: string;
+};
 
 interface OpenRecord {
   ts: number;
@@ -38,7 +52,7 @@ export interface AutoLpResult {
   token: string;
   symbol: string;
   sizeEth?: number;
-  result?: OpenResult;
+  result?: OpenLike;
 }
 
 /** Run the full gate chain; open a position only if ALL pass. Returns null if disabled. */
@@ -54,10 +68,15 @@ export async function maybeAutoLp(candidate: Candidate, verdict: Verdict | null)
   // 1. source allowed
   if (!a.sources.includes(candidate.source)) return skip(`source ${candidate.source} tidak diizinkan`);
 
-  // 2. LLM verdict gate
+  // 1b. OOR cooldown (#2) — skip a token that's been OOR-closed too many times (never fills)
+  if (inOorCooldown(candidate.token)) return skip(`OOR cooldown ${oorCooldownLeftMin(candidate.token)}m (kebuka-tutup terus)`);
+
+  // 2. LLM verdict gate — action is a THRESHOLD (ape > watch > skip), not an exact match, so
+  //    requireAction="watch" accepts watch-or-better (an "ape" also passes).
   if (a.requireLlm) {
     if (!verdict?.llm) return skip("tidak ada verdict LLM");
-    if (verdict.llm.action !== a.requireAction) return skip(`action ${verdict.llm.action} ≠ ${a.requireAction}`);
+    const rank = (x: string): number => (x === "ape" ? 2 : x === "watch" ? 1 : 0);
+    if (rank(verdict.llm.action) < rank(a.requireAction)) return skip(`action ${verdict.llm.action} < ${a.requireAction}`);
     if (verdict.llm.score < a.minScore) return skip(`skor ${verdict.llm.score} < ${a.minScore}`);
   }
 
@@ -78,7 +97,19 @@ export async function maybeAutoLp(candidate: Candidate, verdict: Verdict | null)
   const now = Date.now();
   const st = load();
   st.opens = st.opens.filter((o) => now - o.ts < 24 * 3600_000); // prune >24h
-  const openPositions = await listPositions().then((r) => r.length).catch(() => 0);
+  // count BOTH v3 and v4 — auto-add now opens v4 (3-5%) pools, so a v3-only count let maxOpen leak.
+  const [v3rows, v4rows] = await Promise.all([
+    listPositions().catch(() => []),
+    import("../chain/v4/list.js").then((m) => m.listV4Positions()).catch(() => []),
+  ]);
+  const openPositions = v3rows.length + v4rows.length;
+  // 5a. ONE position per token — don't stack duplicates (VEX was opening every hunt cycle → #381105 +
+  //     #381146). Check the on-chain holdings by tokenAddr, PLUS tokens opened in the last 15 min (the
+  //     list lags a bit after a mint, so a fast re-fire wouldn't see the just-opened position yet).
+  const tok = candidate.token.toLowerCase();
+  const held = [...v3rows, ...v4rows].some((r) => ((r as { tokenAddr?: string }).tokenAddr ?? "").toLowerCase() === tok);
+  const justOpened = st.opens.some((o) => o.token.toLowerCase() === tok && now - o.ts < 15 * 60_000);
+  if (held || justOpened) return skip(`sudah ada posisi ${candidate.symbol} — 1 token = 1 posisi`);
   if (openPositions >= a.maxOpen) return skip(`posisi terbuka ${openPositions} ≥ maxOpen ${a.maxOpen}`);
   const lastHour = st.opens.filter((o) => now - o.ts < 3600_000).length;
   if (lastHour >= a.maxPerHour) return skip(`${lastHour} open/jam ≥ maxPerHour ${a.maxPerHour}`);
@@ -93,20 +124,44 @@ export async function maybeAutoLp(candidate: Candidate, verdict: Verdict | null)
     if (Number(b.eth) < GAS_RESERVE) return skip(`ETH native < gas reserve`);
   }
 
-  // 7. pick pool honoring the fee focus (>= minFeePpm, prefer highest)
-  const pools = await findPools(candidate.token).catch(() => []);
-  const pool = pickLpPool(pools);
-  if (!pool) return skip(`tidak ada pool v3 fee ≥ ${(cfg.lp.minFeePpm / 10000).toFixed(2)}%`);
-
-  // 8. OPEN
+  // Serialize the tx sequence on the shared wallet: take the wallet lock BEFORE qualify + the multi-tx
+  // open, release in finally. Blocks the nonce collision (two opens 2s apart shared a nonce → "nonce
+  // has already been used" / revert, token already bought = stuck). Also mutually excludes auto-close.
+  if (!acquireWallet()) return skip("wallet lagi kirim tx lain (serialize anti nonce-collision)");
   try {
-    log.info(`AUTO-OPEN ${candidate.symbol} ${a.sizeEth}Ξ ${a.mode} pool fee ${pool.fee}`);
-    const result = await openPosition(candidate.token, pool.pool, String(a.sizeEth), { mode: a.mode });
+    // 7. prefer a FARMABLE 3-5% pool
+    const { qualifyCandidate } = await import("../chain/candidate.js");
+    const q = await qualifyCandidate(candidate.token).catch(() => null);
+
+    // 8. OPEN. Mode via cfg.autoLp.mode (/set alpmode single|inrange): "single" = park the quote asset
+    //    (rug-safe) · "inrange" = both-sided NOW (fee langsung, holds token → rug = loss).
+    const inRange = a.mode === "inrange";
+    const modeLabel = inRange ? "in-range" : "single-side";
+    let result: OpenLike;
+    if (q) {
+      const m = await import("../chain/v4/mint.js");
+      log.info(`AUTO-OPEN ${candidate.symbol} ${a.sizeEth}Ξ ${modeLabel} v4 ${q.quote} fee ${q.fee}`);
+      if (q.quote === "usd") {
+        result = inRange ? await m.openV4UsdgInRange(q.v4, String(a.sizeEth)) : await m.openV4UsdgSingleSide(q.v4, String(a.sizeEth));
+      } else {
+        result = inRange
+          ? await m.openV4InRange(candidate.token, String(a.sizeEth), { fee: q.fee })
+          : await m.openV4SingleSide(candidate.token, String(a.sizeEth), { fee: q.fee });
+      }
+    } else {
+      const pools = await findPools(candidate.token).catch(() => []);
+      const pool = pickLpPool(pools);
+      if (!pool) return skip(`tidak ada pool 3-5% (v4) / v3 fee ≥ ${(cfg.lp.minFeePpm / 10000).toFixed(2)}%`);
+      log.info(`AUTO-OPEN ${candidate.symbol} ${a.sizeEth}Ξ ${modeLabel} v3 fee ${pool.fee}`);
+      result = await openPosition(candidate.token, pool.pool, String(a.sizeEth), { mode: inRange ? "inrange" : "single" });
+    }
     st.opens.push({ ts: now, token: candidate.token, sizeEth: a.sizeEth, tokenId: result.tokenId });
     save(st);
     return { opened: true, reason: "opened", token: candidate.token, symbol: candidate.symbol, sizeEth: a.sizeEth, result };
   } catch (e) {
     return skip(`open gagal: ${(e as Error).message.slice(0, 100)}`);
+  } finally {
+    releaseWallet();
   }
 }
 

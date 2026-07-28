@@ -8,6 +8,7 @@ import { ethers } from "ethers";
 import { cfg, C } from "../config.js";
 import { wallet, provider, overrides } from "./client.js";
 import { ERC20_ABI, WETH_ABI, QUOTER_ABI, ROUTER_ABI } from "./abis.js";
+import { kyberSwap, kyberEnabled } from "./kyber.js";
 import { logger } from "../util/log.js";
 import type { TopUp } from "../types.js";
 
@@ -151,6 +152,35 @@ export async function swapWethToToken(
   await tx.wait();
   const after: bigint = await erc.balanceOf!(w.address);
   return { tx: tx.hash, amountOut: after - before };
+}
+
+/**
+ * Buy `tokenAddr` with WETH using the BEST execution available. Routes through the KyberSwap
+ * aggregator (auto multi-hop across every DEX / fee tier / hooked pool → lowest fee + price
+ * impact) and only falls back to a direct single-pool v3 swap if the aggregator can't route.
+ *
+ * Why: buying on the exact fee tier you're about to farm (often a thin, high-fee pool) bleeds
+ * price impact and leaves the in-range LP lopsided — you deposit 0.01 ETH but land ~half. Best-
+ * route execution keeps the token side's value ≈ the WETH spent, so the position fills fully.
+ * The aggregator spends EXACTLY `wethRaw` (kyber gate #3), so the caller's WETH-left math holds.
+ */
+export async function swapWethToTokenBest(tokenAddr: string, wethRaw: bigint, feeHint?: number): Promise<SwapResult> {
+  if (wethRaw <= 0n) return { tx: "", amountOut: 0n };
+  if (kyberEnabled()) {
+    try {
+      const k = await kyberSwap(C.weth, ethers.getAddress(tokenAddr), wethRaw);
+      if (k && k.amountOut > 0n) {
+        log.info(`beli token via KyberSwap (best route) → ${k.amountOut}`);
+        return { tx: k.tx, amountOut: k.amountOut };
+      }
+      log.warn("kyber tak bisa route WETH→token → fallback pool v3 tier terdalam");
+    } catch (e) {
+      log.warn(`kyber gagal (${(e as Error).message.slice(0, 80)}) → fallback pool v3`);
+    }
+  }
+  // fallback: swap on the DEEPEST v3 tier (best quote across tiers), not necessarily the farmed one
+  const best = await quoteWethToToken(tokenAddr, wethRaw).catch(() => ({ amountOut: 0n, fee: 0 }));
+  return swapWethToToken(tokenAddr, wethRaw, best.fee || feeHint || 10000);
 }
 
 /** Sum of WETH Transfer events into `to` in a receipt (real swap output). */

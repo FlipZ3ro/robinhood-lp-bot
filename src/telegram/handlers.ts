@@ -1,13 +1,14 @@
 /** Command + callback handlers. Each renders through tg.send/edit (owner chat only). */
 import { cfg, env, persist } from "../config.js";
 import { tokenMeta } from "../chain/tokens.js";
-import { findPools } from "../chain/pools.js";
+import { findPools, findUsdgPools, USDG } from "../chain/pools.js";
+import { dexPairs, type DexPair } from "../chain/dexscreener.js";
 import { discoverV4Pools, type V4Pool } from "../chain/v4/discover.js";
 import { readV2Pool, type V2Pool } from "../chain/v2/pair.js";
-import { previewRange, openPosition, listPositions, closePosition } from "../chain/positions.js";
+import { previewRange, openPosition, openV3UsdgInRange, openV3UsdgSingleSide, listPositions, closePosition } from "../chain/positions.js";
 import { readLedger, ledgerSummary, backfillLedger } from "../chain/ledger.js";
 import { lifetimePnl } from "../chain/analytics.js";
-import { balances, sellAllTokens } from "../chain/holdings.js";
+import { balances, sellAllTokens, walletTokens, type WalletToken } from "../chain/holdings.js";
 import { tokenBalanceRaw } from "../chain/swaps.js";
 import { ethUsd } from "../chain/price.js";
 import { topVolumeNow, wcfg, usingOwnWatchRpc } from "../watch/scanner.js";
@@ -25,10 +26,40 @@ import type { PoolInfo, TokenMeta, MintMode } from "../types.js";
 interface UPool {
   version: "v2" | "v3" | "v4";
   fee: number;
-  liqLabel: string; // display, e.g. "WETH 0.5" or "✅ liq"
+  liqLabel: string; // display, e.g. "ETH · liq $18k · vol $127k"
+  tvl: number; // effective liquidity (USD) = max(on-chain estimate, DexScreener liq)
+  vol: number; // 24h volume (USD) from DexScreener — the high-fee-farming signal
   v2?: V2Pool;
   v3?: PoolInfo;
   v4?: V4Pool;
+}
+
+const Q96 = 1n << 96n;
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+
+/** Compact USD: $523 · $2.1k · $150k. */
+const fmtUsdShort = (n: number): string =>
+  n >= 1000 ? `$${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : `$${Math.max(0, n).toFixed(0)}`;
+
+/**
+ * Total pool liquidity (USD) ≈ 2× the ETH/USDG-side virtual reserve at the current price. For v3/v2
+ * the ETH side is the pool's REAL WETH balance; for v4 (singleton PoolManager, no per-pool balance)
+ * it's derived from the active liquidity L and sqrtPrice. A rough figure — enough to filter dust
+ * (a scam 99% pool has near-zero L) and rank real pools.
+ */
+function v4TvlUsd(p: V4Pool, px: number): number {
+  const L = p.liquidity;
+  const sp = p.sqrtPriceX96;
+  if (L <= 0n || sp <= 0n) return 0;
+  const c0 = p.poolKey.currency0.toLowerCase();
+  const c1 = p.poolKey.currency1.toLowerCase();
+  const usdgL = USDG.toLowerCase();
+  // amount0 = L·2^96/sqrtP (currency0 raw) ; amount1 = L·sqrtP/2^96 (currency1 raw)
+  if (c0 === ZERO_ADDR) return 2 * Number(ethers.formatEther((L * Q96) / sp)) * px; // ETH = currency0
+  if (c1 === ZERO_ADDR) return 2 * Number(ethers.formatEther((L * sp) / Q96)) * px; // ETH = currency1
+  if (c1 === usdgL) return 2 * Number(ethers.formatUnits((L * sp) / Q96, 6)); // USDG = currency1
+  if (c0 === usdgL) return 2 * Number(ethers.formatUnits((L * Q96) / sp, 6)); // USDG = currency0
+  return 0;
 }
 interface Pending {
   token: string;
@@ -46,37 +77,75 @@ const GAS_RESERVE = 0.0004; // native ETH kept for gas (~4-5 tx at ~0.0001 each)
 const usableEth = (b: { weth: string; eth: string }): number =>
   Number(b.weth) + Math.max(0, Number(b.eth) - GAS_RESERVE);
 
+/**
+ * A computed ETH amount → a parseEther-safe decimal string. A raw JS float such as
+ * 0.00005454831971162516 has 20 significant decimals and makes ethers.parseEther throw
+ * "too many decimals for format"; 9 decimals (1 gwei) is ample precision for an LP amount.
+ * Returns null for non-finite / non-positive / sub-gwei dust so callers can reject it.
+ */
+const toEthStr = (n: number): string | null => {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const s = n.toFixed(9).replace(/0+$/, "").replace(/\.$/, "");
+  return s === "0" || s === "" ? null : s;
+};
+
 // ══════════ open flow ══════════
 
 export async function onCA(addr: string): Promise<void> {
   await send(`🔎 <b>Cari pool v2 + v3 + v4</b> di Robinhood Chain\n<code>${addr}</code>`);
   let meta: TokenMeta;
-  const pools: UPool[] = [];
+  const all: UPool[] = [];
   try {
     meta = await tokenMeta(addr);
     const { discoverV4UsdgPools } = await import("../chain/v4/discover.js");
-    // v2/v3 (token/WETH) + v4 (token/ETH) + v4 (token/USDG) in parallel
-    const [v2, v3, v4, v4usd] = await Promise.all([
+    // ETH price + DexScreener 24h volume + v2/v3 (WETH) + v3 (USDG) + v4 (ETH) + v4 (USDG) in parallel
+    const [px, dex, v2, v3, v3usd, v4, v4usd] = await Promise.all([
+      ethUsd().catch(() => 0),
+      dexPairs(addr, Date.now()).catch(() => new Map<string, DexPair>()),
       readV2Pool(addr).catch(() => null as V2Pool | null),
       findPools(addr).catch(() => [] as PoolInfo[]),
+      findUsdgPools(addr).catch(() => [] as PoolInfo[]),
       discoverV4Pools(addr).catch(() => [] as V4Pool[]),
       discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]),
     ]);
-    if (v2) pools.push({ version: "v2", fee: 3000, liqLabel: `WETH ${v2.wethInPool.toFixed(3)}`, v2 });
-    for (const p of v3) pools.push({ version: "v3", fee: p.fee, liqLabel: `WETH ${p.wethInPool.toFixed(3)}`, v3: p });
-    for (const p of v4) if (p.liquidity > 0n) pools.push({ version: "v4", fee: p.fee, liqLabel: "ETH ✅", v4: p });
-    for (const p of v4usd) if (p.liquidity > 0n) pools.push({ version: "v4", fee: p.fee, liqLabel: "USDG ✅", v4: p });
+    // Enrich each pool with DexScreener 24h VOLUME (matched by pool address for v2/v3, by poolId for
+    // v4). v4 standing TVL isn't readable on Robinhood (singleton PoolManager → getLiquidity is a
+    // dust snapshot, DexScreener reads $0), so VOLUME is the real high-fee-farming signal.
+    const mk = (version: UPool["version"], fee: number, asset: string, est: number, key: string, extra: Partial<UPool>) => {
+      const d = dex.get(key.toLowerCase());
+      const liq = d && d.liqUsd > 0 ? d.liqUsd : est; // DexScreener liq accurate for v2/v3; on-chain estimate for v4
+      const vol = d?.vol24h ?? 0;
+      const label = vol > 0 ? `${asset} · liq ${fmtUsdShort(liq)} · vol ${fmtUsdShort(vol)}` : `${asset} · liq ${fmtUsdShort(liq)}`;
+      all.push({ version, fee, tvl: Math.max(est, d?.liqUsd ?? 0), vol, liqLabel: label, ...extra });
+    };
+    if (v2) mk("v2", 3000, "WETH", 2 * v2.wethInPool * px, v2.pair, { v2 });
+    for (const p of v3) mk("v3", p.fee, "WETH", 2 * p.wethInPool * px, p.pool, { v3: p });
+    for (const p of v3usd) mk("v3", p.fee, "USDG", 2 * (p.usdgInPool ?? 0), p.pool, { v3: p });
+    // NO `liquidity > 0` gate: v4 active-L is a JIT snapshot that flips to 0 between blocks, which
+    // would drop a live, high-volume pool at random. The liq/vol filter below decides instead — a
+    // pool with real 24h VOLUME stays even when its standing liquidity momentarily reads 0.
+    for (const p of v4) mk("v4", p.fee, "ETH", v4TvlUsd(p, px), p.poolId, { v4: p });
+    for (const p of v4usd) mk("v4", p.fee, "USDG", v4TvlUsd(p, px), p.poolId, { v4: p });
   } catch (e) {
     await send(`❌ Gagal baca token/pool: ${short(e, 80)}`);
     return;
   }
-  if (!pools.length) {
-    await send(`⚠️ Tidak ada pool ${esc(meta.symbol)} (v2/v3 WETH, v4 ETH/USDG) dengan likuiditas. Belum bisa LP.`);
+  if (!all.length) {
+    await send(`⚠️ Tidak ada pool ${esc(meta.symbol)} (v2/v3 WETH, v4 ETH/USDG). Belum bisa LP.`);
     return;
   }
-  // sort: highest fee first (memecoin farming preference); on ties v4 > v3 > v2
-  const vRank = (v: string) => (v === "v4" ? 0 : v === "v3" ? 1 : 2);
-  pools.sort((a, b) => b.fee - a.fee || vRank(a.version) - vRank(b.version));
+  // Keep pools with real activity: standing liq ≥ min OR 24h volume ≥ min. High-fee farming lives on
+  // TURNOVER, not standing TVL, so a low-liq pool with volume stays. Highest fee first, then most
+  // volume. If nothing passes, show the 3 most-active anyway (with a warning) so the user isn't stuck.
+  const min = cfg.lp.minPoolTvlUsd;
+  const active = (p: UPool) => Math.max(p.tvl, p.vol);
+  let pools = all.filter((p) => p.tvl >= min || p.vol >= min).sort((a, b) => b.fee - a.fee || b.vol - a.vol);
+  let note = "";
+  if (!pools.length) {
+    pools = [...all].sort((a, b) => active(b) - active(a)).slice(0, 3);
+    note = `\n⚠️ Semua pool < ${fmtUsdShort(min)} liq &amp; vol — nampilin 3 teraktif (tipis, hati-hati).`;
+  }
+  const dropped = all.length - pools.length;
   pending = { token: addr, meta, pools };
   const rows = pools.map((p, i) => [
     {
@@ -87,9 +156,11 @@ export async function onCA(addr: string): Promise<void> {
   const nV2 = pools.filter((p) => p.version === "v2").length;
   const nV3 = pools.filter((p) => p.version === "v3").length;
   const nV4 = pools.filter((p) => p.version === "v4").length;
-  await send(`Ketemu <b>${pools.length}</b> pool ${esc(meta.symbol)} (${nV2} v2 + ${nV3} v3 + ${nV4} v4). Pilih:`, {
-    reply_markup: { inline_keyboard: rows },
-  });
+  const dropLine = dropped > 0 && !note ? `\n<i>(${dropped} pool dust — liq &amp; vol &lt; ${fmtUsdShort(min)} — disembunyiin)</i>` : "";
+  await send(
+    `Ketemu <b>${pools.length}</b> pool ${esc(meta.symbol)} (${nV2} v2 + ${nV3} v3 + ${nV4} v4) · liq/vol ≥ ${fmtUsdShort(min)}.${dropLine}${note}\nPilih:`,
+    { reply_markup: { inline_keyboard: rows } },
+  );
 }
 
 export async function onPick(idx: number, mid: number): Promise<void> {
@@ -98,18 +169,25 @@ export async function onPick(idx: number, mid: number): Promise<void> {
   if (!p) return;
   pending.chosen = p;
   pending.awaitingAmount = true;
-  const [b, tokRaw] = await Promise.all([
+  const isUsdPool = p.v4?.quote === "usd" || p.v3?.quote === "usd";
+  const [b, tokRaw, usdgRaw] = await Promise.all([
     balances().catch(() => null),
     tokenBalanceRaw(pending.token).catch(() => 0n),
+    isUsdPool ? tokenBalanceRaw(USDG).catch(() => 0n) : Promise.resolve(0n),
   ]);
   // token already in the wallet (e.g. bought on a prior attempt) — in-range LP reuses it, no re-buy
   const tokUi = tokRaw > 0n ? Number(tokRaw) / 10 ** pending.meta.decimals : 0;
   pending.heldTokenUi = tokUi;
+  // USDG already in the wallet → offer a one-tap single-side that funds ENTIRELY from it (no ETH
+  // input, no ETH→USDG swap). This is the "kalo udah ada USDG, gak usah input 0.001 buat swap" flow.
+  const usdgUi = Number(ethers.formatUnits(usdgRaw, 6));
 
   // for a v4 dual-side (in-range) mint, compute the ETH that BALANCES the held token so the
   // two sides fill evenly (no swap, minimal leftover) — this is the "hitungan sama" the user wants
+  // ETH-paired v4 only: a "held-token-balancing" ETH amount is meaningless on a USDG pool (both
+  // sides are funded from ETH via Kyber), and computing it there mis-reads the pool price → garbage.
   let balanced = 0;
-  if (tokUi > 0 && p.version === "v4" && p.v4) {
+  if (tokUi > 0 && p.version === "v4" && p.v4 && p.v4.quote !== "usd") {
     try {
       const { balancedEthForHeldToken } = await import("../chain/v4/mint.js");
       balanced = balancedEthForHeldToken(pending.token, pending.meta, p.v4, tokRaw);
@@ -124,10 +202,14 @@ export async function onPick(idx: number, mid: number): Promise<void> {
       ? `♻️ <b>${tokUi.toPrecision(4)} ${esc(pending.meta.symbol)}</b> udah di wallet — bakal <b>dipake ulang</b> (nggak beli lagi).`
       : "";
   const balLine = balanced > 0 ? `⚖️ Buat <b>dual-side seimbang</b> sama token itu: pasang <b>~${balanced.toFixed(5)} ETH</b>.` : "";
-  const extra =
-    balanced > 0
-      ? { reply_markup: { inline_keyboard: [[{ text: `⚖️ Dual-side seimbang (~${balanced.toFixed(4)} Ξ)`, callback_data: "ballp" }]] } }
-      : {};
+  const showUsdgBtn = isUsdPool && usdgUi >= 1;
+  const usdgLine = showUsdgBtn
+    ? `💵 <b>$${usdgUi.toFixed(2)} USDG</b> udah di wallet — tap tombol buat <b>single-side tanpa swap / tanpa input</b>.`
+    : "";
+  const kbRows: { text: string; callback_data: string }[][] = [];
+  if (balanced > 0) kbRows.push([{ text: `⚖️ Dual-side seimbang (~${balanced.toFixed(4)} Ξ)`, callback_data: "ballp" }]);
+  if (showUsdgBtn) kbRows.push([{ text: `💵 Single-side pakai USDG wallet ($${usdgUi.toFixed(2)})`, callback_data: "usdgw" }]);
+  const extra = kbRows.length ? { reply_markup: { inline_keyboard: kbRows } } : {};
   await edit(
     mid,
     [
@@ -137,8 +219,9 @@ export async function onPick(idx: number, mid: number): Promise<void> {
         : "",
       reuseLine,
       balLine,
+      usdgLine,
       ``,
-      `💬 <b>Ketik jumlah ETH</b> yang mau di-LP (contoh: <code>0.005</code>)${balanced > 0 ? " — atau tap tombol di bawah." : ""}`,
+      `💬 <b>Ketik jumlah ETH</b> yang mau di-LP (contoh: <code>0.005</code>)${kbRows.length ? " — atau tap tombol di bawah." : ""}`,
     ]
       .filter(Boolean)
       .join("\n"),
@@ -149,9 +232,59 @@ export async function onPick(idx: number, mid: number): Promise<void> {
 /** One-tap: dual-side v4 mint with the ETH amount that balances the held token. */
 export async function onBalancedLp(mid: number): Promise<void> {
   if (!pending?.chosen?.v4 || !pending.balancedEth) return;
-  pending.ethAmt = String(pending.balancedEth);
+  const amt = toEthStr(pending.balancedEth);
+  const b = await balances().catch(() => null);
+  if (!amt || (b && Number(amt) > usableEth(b) + 1e-9)) {
+    pending.awaitingAmount = true;
+    await send(
+      `⚠️ Nilai dual-side seimbang (${pending.balancedEth}) nggak valid / lebih gede dari saldo (${b ? usableEth(b).toFixed(5) : "?"} ETH). Ketik jumlah ETH manual aja (contoh: <code>0.005</code>).`,
+    );
+    return;
+  }
+  pending.ethAmt = amt;
   pending.awaitingAmount = false;
   await onMintV4(mid, "inrange");
+}
+
+/**
+ * One-tap: open SINGLE-SIDE USDG funded ENTIRELY from the USDG already in the wallet — no ETH
+ * amount to type, no ETH→USDG swap. Sizes the position to the full held USDG by passing its
+ * ETH-equivalent as the budget; the mint fn computes target = ethAmt×ethUsd and reuses the held
+ * USDG (buys nothing). Only native ETH for gas is needed. This is the "udah ada USDG → gak usah
+ * input 0.001 buat swap" flow.
+ */
+export async function onUseWalletUsdg(mid: number): Promise<void> {
+  if (!pending?.chosen) return;
+  const isUsd = pending.chosen.v4?.quote === "usd" || pending.chosen.v3?.quote === "usd";
+  if (!isUsd) {
+    await send("Pool ini bukan pair USDG — pakai input ETH biasa.");
+    return;
+  }
+  const [usdgRaw, b, px] = await Promise.all([
+    tokenBalanceRaw(USDG).catch(() => 0n),
+    balances().catch(() => null),
+    ethUsd().catch(() => 0),
+  ]);
+  const usdgUi = Number(ethers.formatUnits(usdgRaw, 6));
+  if (usdgUi < 1) {
+    await send(`USDG di wallet cuma $${usdgUi.toFixed(2)} — kurang buat single-side. Input ETH manual aja.`);
+    return;
+  }
+  if (b && Number(b.eth) < GAS_RESERVE) {
+    await send(`⚠️ ETH native ${Number(b.eth).toFixed(5)} < gas reserve ${GAS_RESERVE} — mint tetep butuh gas. Isi dikit ETH native dulu.`);
+    return;
+  }
+  if (!(px > 0)) {
+    await send("⚠️ Harga ETH/USD lagi gak kebaca — coba lagi bentar (butuh buat sizing USDG).");
+    return;
+  }
+  // USD → ETH-equivalent budget so the mint fn's target ≈ held USDG → reuse buys nothing (no swap).
+  pending.ethAmt = toEthStr(usdgUi / px) ?? String(usdgUi / px);
+  pending.awaitingAmount = false;
+  const feePct = (pending.chosen.fee / 10000).toFixed(2);
+  await edit(mid, `⏳ <b>Single-side USDG pakai $${usdgUi.toFixed(2)} dari wallet…</b> (no swap · fee ${feePct}%)`);
+  if (pending.chosen.version === "v4") return onMintV4(mid, "v4us");
+  return onMintV3Usdg(mid, true);
 }
 
 export async function onAmount(text: string): Promise<void> {
@@ -174,7 +307,7 @@ export async function onAmount(text: string): Promise<void> {
     );
     return;
   }
-  pending.ethAmt = String(eth);
+  pending.ethAmt = toEthStr(eth) ?? String(eth);
   pending.awaitingAmount = false;
 
   // ── v2 pool → zap (full-range, always both-sided) ──
@@ -204,19 +337,20 @@ export async function onAmount(text: string): Promise<void> {
     const feePct = (pending.chosen.fee / 10000).toFixed(2);
     const isUsd = pending.chosen.v4?.quote === "usd";
     if (isUsd) {
-      // USDG-paired pool: both sides are ERC20 → only both-sided in-range makes sense.
       await send(
         [
           `<b>Konfirmasi LP · Uniswap v4 · USDG</b> 🦄`,
           `${esc(pending.meta.symbol)}/USDG · fee <b>${feePct}%</b> · deposit <b>${eth} ETH</b>`,
           ``,
-          `🎯 <b>In-range (farming)</b> — bot beli USDG + ${esc(pending.meta.symbol)} dari ETH lo (rute terbaik via Kyber), terus mint both-sided. <b>Fee ${feePct}% jalan LANGSUNG.</b>`,
-          `⚠️ Langsung pegang token (rug = rugi). Nggak ada single-side di pair USDG.`,
+          `🎯 <b>In-range (farming)</b> — beli USDG + ${esc(pending.meta.symbol)} dari ETH (Kyber), mint both-sided. <b>Fee ${feePct}% jalan LANGSUNG.</b> Langsung pegang token (rug = rugi).`,
+          ``,
+          `🛡 <b>Single-side USDG</b> — parkir <b>USDG doang (0 token)</b>, range di sisi USDG. Fee cuma pas ${esc(pending.meta.symbol)} <b>PUMP</b> masuk range. Rug-safe: kalo token dump, USDG lo utuh.`,
         ].join("\n"),
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: `🎯 LP USDG ${feePct}% (${eth}Ξ)`, callback_data: "mint:v4r" }],
+              [{ text: `🎯 In-range ${feePct}% (${eth}Ξ)`, callback_data: "mint:v4r" }],
+              [{ text: `🛡 Single-side USDG ${feePct}%`, callback_data: "mint:v4us" }],
               [{ text: "❌ Cancel", callback_data: "cancel" }],
             ],
           },
@@ -238,6 +372,31 @@ export async function onAmount(text: string): Promise<void> {
           inline_keyboard: [
             [{ text: `🎯 In-range farming ${feePct}%`, callback_data: "mint:v4r" }],
             [{ text: `🛡 Single-side ETH ${feePct}%`, callback_data: "mint:v4" }],
+            [{ text: "❌ Cancel", callback_data: "cancel" }],
+          ],
+        },
+      },
+    );
+    return;
+  }
+
+  // ── v3 token/USDG pool → in-range (farming) or single-side USDG ──
+  if (pending.chosen.v3?.quote === "usd") {
+    const feePct = (pending.chosen.fee / 10000).toFixed(2);
+    await send(
+      [
+        `<b>Konfirmasi LP · Uniswap v3 · USDG</b>`,
+        `${esc(pending.meta.symbol)}/USDG · fee <b>${feePct}%</b> · deposit <b>${eth} ETH</b>`,
+        ``,
+        `🎯 <b>In-range (farming)</b> — beli USDG + ${esc(pending.meta.symbol)} dari ETH (Kyber), mint both-sided. <b>Fee ${feePct}% jalan LANGSUNG.</b> Langsung pegang token (rug = rugi).`,
+        ``,
+        `🛡 <b>Single-side USDG</b> — parkir <b>USDG doang (0 token)</b>, range di sisi USDG. Fee cuma pas ${esc(pending.meta.symbol)} <b>PUMP</b> masuk range. Rug-safe: kalo token dump, USDG lo utuh.`,
+      ].join("\n"),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: `🎯 In-range ${feePct}% (${eth}Ξ)`, callback_data: "mint:v3u" }],
+            [{ text: `🛡 Single-side USDG ${feePct}%`, callback_data: "mint:v3us" }],
             [{ text: "❌ Cancel", callback_data: "cancel" }],
           ],
         },
@@ -284,7 +443,8 @@ export async function onMint(mid: number, action = "single"): Promise<void> {
   invalidateListCache();
   if (!pending?.chosen || !pending.ethAmt) return;
   if (pending.chosen.version === "v2") return onMintV2(mid);
-  if (pending.chosen.version === "v4") return onMintV4(mid, action === "v4r" ? "inrange" : "single");
+  if (pending.chosen.version === "v4") return onMintV4(mid, action);
+  if (pending.chosen.v3?.quote === "usd") return onMintV3Usdg(mid, action === "v3us");
 
   const mode: MintMode = action === "inrange" ? "inrange" : "single";
   const inR = mode === "inrange";
@@ -314,21 +474,51 @@ export async function onMint(mid: number, action = "single"): Promise<void> {
   }
 }
 
-async function onMintV4(mid: number, mode: "single" | "inrange"): Promise<void> {
+/** Mint a token/USDG v3 position — both-sided in-range, or single-side USDG (park stable only). */
+async function onMintV3Usdg(mid: number, single = false): Promise<void> {
+  invalidateListCache();
+  if (!pending?.chosen?.v3 || !pending.ethAmt) return;
+  const feePct = (pending.chosen.fee / 10000).toFixed(2);
+  await edit(mid, `⏳ <b>Minting v3 USDG ${pending.ethAmt} ETH…</b> ${single ? "(Kyber → USDG → single-side)" : "(Kyber → USDG+token → mint both-sided)"}`);
+  try {
+    const r = single ? await openV3UsdgSingleSide(pending.chosen.v3, pending.ethAmt) : await openV3UsdgInRange(pending.chosen.v3, pending.ethAmt);
+    const sym = pending.meta.symbol;
+    pending = null;
+    await send(
+      [
+        `✅ <b>${esc(sym)}/USDG #${r.tokenId ?? "?"}</b> [v3] ${single ? "🛡 SINGLE-SIDE USDG" : "🎯 IN-RANGE (farming)"}`,
+        r.wrapHash ? `wrap: <a href="${explorerTx(r.wrapHash)}">tx</a>` : "",
+        r.swapHash ? `beli USDG (Kyber): <a href="${explorerTx(r.swapHash)}">tx</a>` : "",
+        `pool fee <b>${feePct}%</b> · range tick ${r.tickLower}..${r.tickUpper}`,
+        `deposit ${r.depositEth}Ξ · ${esc(r.side)}`,
+        `mint: <a href="${explorerTx(r.txHash)}">tx</a>`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  } catch (e) {
+    await send(`❌ Mint gagal: ${short(e, 160)}`);
+  }
+}
+
+async function onMintV4(mid: number, action: string): Promise<void> {
   invalidateListCache();
   if (!pending?.chosen?.v4 || !pending.ethAmt) return;
   const fee = pending.chosen.v4.fee;
   const isUsd = pending.chosen.v4.quote === "usd";
-  const inR = mode === "inrange" || isUsd; // USDG pairs are always both-sided in-range
   const v4pool = pending.chosen.v4;
-  await edit(mid, `⏳ <b>Minting v4 ${pending.ethAmt} ETH…</b> ${isUsd ? "(Kyber → USDG+token → mint)" : inR ? "(swap → Permit2 → mint in-range)" : "(simulasi → mint single-side)"}`);
+  const usdgSingle = isUsd && action === "v4us";
+  const inR = isUsd ? !usdgSingle : action === "v4r" || action === "inrange"; // ETH: v4r/inrange = farming
+  await edit(mid, `⏳ <b>Minting v4 ${pending.ethAmt} ETH…</b> ${usdgSingle ? "(Kyber → USDG → single-side)" : isUsd ? "(Kyber → USDG+token → mint)" : inR ? "(swap → Permit2 → mint in-range)" : "(simulasi → mint single-side)"}`);
   try {
-    const { openV4SingleSide, openV4InRange, openV4UsdgInRange } = await import("../chain/v4/mint.js");
-    const r = isUsd
-      ? await openV4UsdgInRange(v4pool, pending.ethAmt)
-      : inR
-        ? await openV4InRange(pending.token, pending.ethAmt, { fee })
-        : await openV4SingleSide(pending.token, pending.ethAmt, { fee });
+    const { openV4SingleSide, openV4InRange, openV4UsdgInRange, openV4UsdgSingleSide } = await import("../chain/v4/mint.js");
+    const r = usdgSingle
+      ? await openV4UsdgSingleSide(v4pool, pending.ethAmt)
+      : isUsd
+        ? await openV4UsdgInRange(v4pool, pending.ethAmt)
+        : inR
+          ? await openV4InRange(pending.token, pending.ethAmt, { fee })
+          : await openV4SingleSide(pending.token, pending.ethAmt, { fee });
     const sym = pending.meta.symbol;
     pending = null;
     await send(
@@ -427,7 +617,7 @@ export async function onList(mid: number | null = null, force = false): Promise<
     const rate = hrs > 0.05 && r.feeEth ? `${usd(r.feeEth / hrs)}/jam` : "—";
     const tag = `${r.inRange ? "🟢 IN RANGE" : "🔴 OUT OF RANGE"}${r.mode === "inrange" ? " · 🎯" : ""}`;
     if (i) T.push("");
-    T.push(`${tokenEmoji(r.tokenSym)} ${r.tokenSym}/WETH  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
+    T.push(`${tokenEmoji(r.tokenSym)} ${r.pair ?? `${r.tokenSym}/WETH`}  ·  fee ${(r.fee / 10000).toFixed(2)}%  ·  #${r.tokenId}`);
     T.push(`   ${tag}`);
     T.push("   " + "─".repeat(34));
     T.push(`   ${padR("modal", 7)} ${padL(r.depEth != null ? r.depEth.toFixed(6) + "Ξ" : "—", 11)}  ${padL(r.depEth != null ? usd(r.depEth) : "—", 9)}`);
@@ -435,7 +625,7 @@ export async function onList(mid: number | null = null, force = false): Promise<
     T.push(`   ${padR("fee", 7)} ${padL(r.feeEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.feeEth), 9)}`);
     T.push(`   ${padR("umur", 7)} ${padL(fmtAge(r.ageMs) + (r.ageSource === "onchain" ? " ⛓" : ""), 11)}  ${rate}`);
     T.push(`   ${padR("MCAP", 7)} ${padL(fmtMcap(r.mcapNow), 11)}  ${r.entryMcap ? "entry " + fmtMcap(r.entryMcap) : "—"}`);
-    T.push(`   ${padR("range", 7)} ${fmtMcap(r.rangeMcapLow)} → ${fmtMcap(r.rangeMcapHigh)}`);
+    if (r.rangeMcapHigh > 0) T.push(`   ${padR("range", 7)} ${fmtMcap(r.rangeMcapLow)} → ${fmtMcap(r.rangeMcapHigh)}`);
     if (r.pnlEth != null) {
       T.push(`   ${padR("PnL", 7)} ${padL(sg(r.pnlEth, 6) + "Ξ", 11)}  ${padL((r.pnlEth >= 0 ? "+" : "-") + "$" + Math.abs(r.pnlEth * px).toFixed(2), 9)}  ${sg(r.pnlPct ?? 0, 1)}%`);
     } else {
@@ -917,6 +1107,9 @@ export async function onV4Close(text: string): Promise<void> {
         `✅ <b>v4 #${tokenId} closed</b> · pool fee ${(r.fee / 10000).toFixed(2)}%`,
         `Balik: ${r.recv0 > 0 ? `${r.recv0.toFixed(6)} ${r.sym0}` : ""}${r.recv0 > 0 && r.recv1 > 0 ? " + " : ""}${r.recv1 > 0 ? `${r.recv1.toFixed(6)} ${r.sym1}` : ""}`,
         r.feeEth > 0 ? `🧲 fee earned: <b>${r.feeEth.toFixed(6)}Ξ</b>` : "",
+        r.sweptEth && r.sweptEth > 0
+          ? `💱 proceeds → <b>+${r.sweptEth.toFixed(6)}Ξ</b> (auto-swap ke ETH)${r.sweepHash ? ` · <a href="${explorerTx(r.sweepHash)}">tx</a>` : ""}`
+          : "",
         r.forfeited ? `⚠️ <b>${esc(r.forfeited)}</b> nggak bisa ditarik (honeypot/rug) — direlakan, ETH diselamatkan.` : "",
         `tx: <a href="${explorerTx(r.txHash)}">tx</a>`,
       ]
@@ -980,54 +1173,82 @@ export async function onV2Close(pair: string): Promise<void> {
 
 // ══════════ /auto (autonomous LP) ══════════
 
-export async function onAuto(arg?: string): Promise<void> {
+export async function onAuto(arg = ""): Promise<void> {
   const a = cfg.autoLp;
-  if (arg === "on") {
-    cfg.autoLp.enabled = true;
+  const parts = arg.trim().split(/\s+/).filter(Boolean);
+  const cmd = (parts[0] ?? "").toLowerCase();
+  const { startManage, stopManage } = await import("../radar/automanage.js");
+
+  if (cmd === "on") {
+    a.enabled = true;
     persist();
+    startManage();
+    const armed = a.tpPct > 0 || a.slPct > 0 || a.closeOor;
     await send(
       [
-        `🤖 <b>AUTO-LP ON</b> ⚠️`,
-        `Bot bakal buka posisi OTOMATIS (pakai dana beneran) kalau kandidat lolos radar + semua gate.`,
-        ``,
-        `Gate sekarang:`,
-        `• source: ${a.sources.join(", ")}`,
-        `• verdict LLM: ${a.requireAction} & skor ≥ ${a.minScore}`,
-        `• ukuran: <b>${a.sizeEth}Ξ</b> · mode: ${a.mode}`,
-        `• likuiditas min $${a.minLiqUsd} · tax maks ${a.maxTaxPct}%`,
-        `• cap: ${a.maxOpen} posisi · ${a.maxPerHour}/jam · ${a.dailyCapEth}Ξ/hari`,
+        `🤖 <b>AUTO ON</b> ⚠️ (add + close, pakai dana real)`,
+        `• <b>Auto-add</b>: buka posisi kalau kandidat lolos radar + gate (source ${a.sources.join("/")}, ${a.requireAction}≥${a.minScore}, ${a.sizeEth}Ξ ${a.mode}).`,
+        `• <b>Auto-close</b>: ${armed ? `TP ${a.tpPct > 0 ? "+" + a.tpPct + "%" : "off"} · SL ${a.slPct > 0 ? "-" + a.slPct + "%" : "off"} · OOR ${a.closeOor ? "on" : "off"} (cek tiap ${a.manageSec}s)` : "belum di-set — pakai <code>/auto tp 100</code> · <code>/auto sl 50</code> · <code>/auto oor on</code>"}`,
         ``,
         `Matiin: <code>/auto off</code>`,
       ].join("\n"),
     );
     return;
   }
-  if (arg === "off") {
-    cfg.autoLp.enabled = false;
+  if (cmd === "off") {
+    a.enabled = false;
     persist();
-    await send("🤖 <b>AUTO-LP OFF</b>. Balik ke manual (notif + tombol).");
+    stopManage();
+    await send("🤖 <b>AUTO OFF</b>. Balik ke manual (notif + tombol). Threshold TP/SL/OOR tetep kesimpen.");
     return;
   }
+  if (cmd === "tp" || cmd === "sl") {
+    const v = parseFloat(parts[1] ?? "");
+    if (!(v >= 0)) {
+      await send(`Format: <code>/auto ${cmd} ${cmd === "tp" ? "100" : "50"}</code> (persen, 0 = off)`);
+      return;
+    }
+    if (cmd === "tp") a.tpPct = v;
+    else a.slPct = v;
+    persist();
+    await send(
+      cmd === "tp"
+        ? `🎯 Take-profit: ${v > 0 ? `posisi auto-close pas profit <b>≥ +${v}%</b>` : "OFF"}.${v > 0 && !a.enabled ? " (nyalain: /auto on)" : ""}`
+        : `🛑 Stop-loss: ${v > 0 ? `posisi auto-close pas rugi <b>≤ -${v}%</b>` : "OFF"}.${v > 0 && !a.enabled ? " (nyalain: /auto on)" : ""}`,
+    );
+    return;
+  }
+  if (cmd === "oor") {
+    a.closeOor = /^(on|1|true|yes)$/i.test(parts[1] ?? "");
+    persist();
+    await send(`🚪 Auto-close out-of-range: <b>${a.closeOor ? "ON" : "OFF"}</b>.${a.closeOor && !a.enabled ? " (nyalain: /auto on)" : ""}`);
+    return;
+  }
+
   const s = autoLpStatus();
+  const armed = a.tpPct > 0 || a.slPct > 0 || a.closeOor;
   const T = [
-    `${padR("status", 14)} ${a.enabled ? "🟢 ON" : "off"}`,
-    `${padR("ukuran", 14)} ${a.sizeEth}Ξ · ${a.mode}`,
-    `${padR("trigger", 14)} ${a.requireAction} & skor ≥ ${a.minScore}`,
-    `${padR("source", 14)} ${a.sources.join(", ")}`,
-    `${padR("likuid min", 14)} $${a.minLiqUsd}`,
-    `${padR("tax maks", 14)} ${a.maxTaxPct}%`,
-    `${padR("cap posisi", 14)} ${a.maxOpen}`,
-    `${padR("cap /jam", 14)} ${a.maxPerHour}`,
-    `${padR("cap /hari", 14)} ${a.dailyCapEth}Ξ`,
+    `${padR("status", 13)} ${a.enabled ? "🟢 ON" : "off"}`,
+    `── auto-add ──`,
+    `${padR("ukuran", 13)} ${a.sizeEth}Ξ · ${a.mode}`,
+    `${padR("trigger", 13)} ${a.requireAction} & skor ≥ ${a.minScore}`,
+    `${padR("source", 13)} ${a.sources.join(", ")}`,
+    `${padR("cap", 13)} ${a.maxOpen} posisi · ${a.maxPerHour}/jam · ${a.dailyCapEth}Ξ/hari`,
+    `── auto-close ──`,
+    `${padR("take-profit", 13)} ${a.tpPct > 0 ? "+" + a.tpPct + "%" : "off"}`,
+    `${padR("stop-loss", 13)} ${a.slPct > 0 ? "-" + a.slPct + "%" : "off"}`,
+    `${padR("close OOR", 13)} ${a.closeOor ? "on" : "off"}`,
+    `${padR("cek tiap", 13)} ${a.manageSec}s`,
     ``,
-    `${padR("hari ini", 14)} ${s.opensToday} open · ${s.spentToday.toFixed(4)}Ξ`,
-    `${padR("jam ini", 14)} ${s.lastHour} open`,
+    `${padR("hari ini", 13)} ${s.opensToday} open · ${s.spentToday.toFixed(4)}Ξ`,
   ];
   await send(
-    `🤖 <b>Auto-LP</b>${pre(T.join("\n"))}` +
+    `🤖 <b>Auto (add + close)</b>${pre(T.join("\n"))}` +
       `<code>/auto on</code> · <code>/auto off</code>\n` +
-      `Tune: <code>/set alpsize 0.001</code> · <code>/set alpscore 75</code> · <code>/set alpmaxopen 3</code> · <code>/set alpdaily 0.01</code> · <code>/set alpminliq 20000</code>\n` +
-      `<i>⚠️ Eksekusi tx otomatis pakai dana real. Default single-side (rug-safe). Butuh radar aktif (/set radar 1).</i>`,
+      `Close: <code>/auto tp 100</code> · <code>/auto sl 50</code> · <code>/auto oor on|off</code>\n` +
+      `Mode: <code>/set alpmode single</code> (rug-safe) · <code>/set alpmode inrange</code> (fee langsung)\n` +
+      `Add: <code>/set alpsize 0.001</code> · <code>/set alpscore 75</code> · <code>/set alpmaxopen 3</code>\n` +
+      `<i>⚠️ Tx otomatis pakai dana real. ${armed ? "Auto-close ARMED." : "Auto-close belum di-set."} Auto-add butuh radar (/set radar 1).</i>`,
   );
 }
 
@@ -1073,7 +1294,8 @@ export async function onClose(tokenId: string, mid: number, swapToken = true): P
         .filter(Boolean)
         .join("\n"),
     );
-    await sendCloseCard({ name: `${r.tokenSym}/WETH`, version: "v3", depEth: r.depEth, outEth: r.valEth, pnlEth: r.pnlEth, pnlPct: r.pnlPct, heldMs: r.heldMs });
+    const isUsdgClose = r.wethSym === "USDG";
+    await sendCloseCard({ name: isUsdgClose ? `${r.tokenSym}/USDG` : `${r.tokenSym}/WETH`, version: "v3", quote: isUsdgClose ? "usd" : "eth", depEth: r.depEth, outEth: r.valEth, pnlEth: r.pnlEth, pnlPct: r.pnlPct, heldMs: r.heldMs });
   } catch (e) {
     await send(`❌ Close gagal: ${short(e, 120)}`);
   }
@@ -1123,29 +1345,129 @@ export async function onCloseAll(): Promise<void> {
 // ══════════ 🔄 swap (KyberSwap aggregator) ══════════
 
 let pendingSwap: { fromAddr: string; toAddr: string; amountIn: bigint; fromSym: string; toSym: string; toDec: number } | null = null;
+// DEX-style swap menu state (token picker → % amount)
+let swapTokens: WalletToken[] = [];
+let swapFrom: WalletToken | null = null;
 
+/** Pretty token amount: thousands-separated when big, precise when small. */
+const fmtAmt = (n: number): string =>
+  n >= 1000 ? Math.round(n).toLocaleString("en-US") : n >= 1 ? n.toFixed(2) : n > 0 ? n.toPrecision(4) : "0";
+
+/** /swap — no args → DEX-style token menu (auto-detect wallet holdings); with args → manual form. */
 export async function onSwap(text: string): Promise<void> {
-  const { kyberEnabled, kyberRoute, routeBreakdown, KYBER_NATIVE } = await import("../chain/kyber.js");
+  const { kyberEnabled } = await import("../chain/kyber.js");
   if (!kyberEnabled()) {
     await send("🔄 Swap butuh KyberSwap — <code>KYBERSWAP_ROUTER_ADDRESS</code> belum diset di .env.");
     return;
   }
-  const parts = text.trim().split(/\s+/);
-  if (parts.length < 4) {
-    await sendMenu(
+  return text.trim().split(/\s+/).length >= 4 ? onSwapManual(text) : onSwapMenu();
+}
+
+/** Auto-detect sellable tokens in the wallet → tap one → tap a %, no CA/amount typing. */
+async function onSwapMenu(): Promise<void> {
+  const m = await send("🔄 <b>Scan token di wallet…</b> <i>(ngecek rute jual tiap token, bisa ~10-20s)</i>");
+  const mid = m?.result?.message_id;
+  swapFrom = null;
+  const toks = await walletTokens().catch(() => [] as WalletToken[]);
+  swapTokens = toks;
+  if (!toks.length) {
+    await edit(
+      mid,
       [
-        "🔄 <b>Swap via KyberSwap</b> (rute terbaik otomatis)",
-        "Format: <code>/swap &lt;jumlah&gt; &lt;dari&gt; &lt;ke&gt;</code>",
+        "🔄 <b>Swap</b>",
+        "Nggak ada token (yang bisa dijual) kedetect di wallet.",
         "",
-        "• <code>/swap 0.01 eth 0xCA</code> — ETH → token",
-        "• <code>/swap 100 0xCA eth</code> — token → ETH",
-        "• <code>/swap 50 0xTokenA 0xTokenB</code> — token → token",
-        "",
-        "<i>dari/ke: ketik <b>eth</b> atau alamat kontrak (0x… 40 hex)</i>",
+        "Beli / manual: <code>/swap &lt;jumlah&gt; &lt;dari&gt; &lt;ke&gt;</code> (dari/ke = <b>eth</b> atau CA).",
       ].join("\n"),
     );
     return;
   }
+  const rows = toks.map((t) => [{ text: `${tokenEmoji(t.symbol)} ${t.symbol} · ${fmtAmt(t.ui)} ($${t.usd.toFixed(2)})`, callback_data: `swf:${t.addr}` }]);
+  await edit(mid, [`🔄 <b>Swap → ETH</b>`, `Pilih token yang mau dijual (${toks.length} kedetect):`].join("\n"), {
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+/** Token picked (swf:<addr>) → show the 10-100% amount buttons (DEX-style). */
+export async function onSwapFrom(addr: string, mid: number): Promise<void> {
+  const t = swapTokens.find((x) => x.addr.toLowerCase() === addr.toLowerCase());
+  if (!t) {
+    await edit(mid, "Token nggak kebaca lagi — kirim /swap ulang.");
+    return;
+  }
+  swapFrom = t;
+  await edit(
+    mid,
+    [
+      `🔄 <b>Jual ${tokenEmoji(t.symbol)} ${esc(t.symbol)} → ETH</b>`,
+      `Saldo: <b>${fmtAmt(t.ui)}</b> ($${t.usd.toFixed(2)}) · jual semua ≈ ${t.ethOut.toPrecision(4)} ETH`,
+      ``,
+      `Mau jual berapa persen?`,
+    ].join("\n"),
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "10%", callback_data: "swp:10" },
+            { text: "25%", callback_data: "swp:25" },
+            { text: "50%", callback_data: "swp:50" },
+          ],
+          [
+            { text: "75%", callback_data: "swp:75" },
+            { text: "💯 100%", callback_data: "swp:100" },
+          ],
+          [
+            { text: "🔙 Token lain", callback_data: "swap" },
+            { text: "❌ Cancel", callback_data: "cancel" },
+          ],
+        ],
+      },
+    },
+  );
+}
+
+/** Percentage picked (swp:<pct>) → quote via Kyber, show the ✅ Swap confirm. */
+export async function onSwapPct(pct: number, mid: number): Promise<void> {
+  if (!swapFrom) {
+    await edit(mid, "Pilih token dulu — kirim /swap ulang.");
+    return;
+  }
+  const t = swapFrom;
+  // read the LIVE balance (wallet is shared with the arb bot + Blockscout can lag) so 100% never
+  // tries to sell more than we actually hold, and the % is always of the real current balance.
+  const liveRaw = await tokenBalanceRaw(t.addr).catch(() => t.raw);
+  const bal = liveRaw > 0n ? liveRaw : t.raw;
+  const amountIn = pct >= 100 ? bal : (bal * BigInt(pct)) / 100n;
+  if (amountIn <= 0n) {
+    await edit(mid, "Saldo token 0 sekarang — mungkin udah kejual / kepake. Kirim /swap ulang.");
+    return;
+  }
+  const { kyberRoute, routeBreakdown, KYBER_NATIVE } = await import("../chain/kyber.js");
+  await edit(mid, `🔄 Cari rute ${pct}% ${esc(t.symbol)} → ETH…`);
+  const route = await kyberRoute(t.addr, KYBER_NATIVE, amountIn).catch(() => null);
+  if (!route) {
+    await edit(mid, "❌ Kyber nggak nemu rute (likuiditas kering?).");
+    return;
+  }
+  const outUi = Number(ethers.formatEther(BigInt(route.routeSummary.amountOut)));
+  const px = await ethUsd().catch(() => 0);
+  const amtUi = Number(ethers.formatUnits(amountIn, t.decimals));
+  pendingSwap = { fromAddr: t.addr, toAddr: KYBER_NATIVE, amountIn, fromSym: t.symbol, toSym: "ETH", toDec: 18 };
+  await edit(
+    mid,
+    [
+      `🔄 <b>Jual ${pct}% ${esc(t.symbol)}</b> = ${fmtAmt(amtUi)} ${esc(t.symbol)}`,
+      `→ ~<b>${outUi.toPrecision(6)} ETH</b>${px ? ` <i>($${(outUi * px).toFixed(2)})</i>` : ""}`,
+      `rute: <i>${esc(routeBreakdown(route.routeSummary) || "kyber")}</i> · slippage ${cfg.lp.slippagePct}%`,
+    ].join("\n"),
+    { reply_markup: { inline_keyboard: [[{ text: "✅ Swap", callback_data: "swapdo" }, { text: "❌ Cancel", callback_data: "cancel" }]] } },
+  );
+}
+
+/** Manual power-user form: /swap <amount> <from> <to>  (eth or 0x… contract, any direction). */
+async function onSwapManual(text: string): Promise<void> {
+  const { kyberRoute, routeBreakdown, KYBER_NATIVE } = await import("../chain/kyber.js");
+  const parts = text.trim().split(/\s+/);
   const [, amtStr, fromS, toS] = parts as [string, string, string, string];
   const resolve = (s: string) => (/^eth$/i.test(s) ? KYBER_NATIVE : /^0x[0-9a-fA-F]{40}$/.test(s) ? ethers.getAddress(s) : null);
   const fromAddr = resolve(fromS);
@@ -1214,6 +1536,52 @@ export async function onSwapDo(mid: number): Promise<void> {
   } catch (e) {
     await edit(mid, `❌ Swap gagal: ${short(e, 150)}`);
   }
+}
+
+// ══════════ 🎯 candidate hunter ══════════
+
+/** /hunt [on|off|now] — the quality-candidate scanner (fee 3-5% + rame + lolos screening). */
+export async function onHunt(arg?: string): Promise<void> {
+  const { startScan, stopScan, scanStatus, scanNow } = await import("../radar/scanLoop.js");
+  const a = (arg ?? "").toLowerCase();
+  if (a === "on") {
+    cfg.scan.enabled = true;
+    persist();
+    startScan();
+    await send(`🎯 <b>Hunter ON</b> — scan kandidat LP tiap ${cfg.scan.intervalMin} menit (fee 3-5% + tx rame + lolos screening).`);
+    return;
+  }
+  if (a === "off") {
+    cfg.scan.enabled = false;
+    persist();
+    stopScan();
+    await send("🎯 <b>Hunter OFF.</b>");
+    return;
+  }
+  if (a === "now") {
+    const m = await send("🎯 Scan kandidat sekarang… <i>(GMGN trending + screening, bisa ~15-30s)</i>");
+    const mid = m?.result?.message_id;
+    try {
+      const r = await scanNow();
+      await edit(mid, `🎯 Scan kelar — <b>${r.scanned}</b> trending → <b>${r.found} kandidat</b> lolos (fee 3-5% + rame + screening).${r.found ? " Alert dikirim ↑" : " Gak ada yang lolos sekarang."}`);
+    } catch (e) {
+      await edit(mid, `❌ Scan gagal: ${short(e, 100)}`);
+    }
+    return;
+  }
+  const st = scanStatus();
+  await send(
+    [
+      `🎯 <b>Hunter kandidat LP</b> — ${st.on ? "🟢 ON" : "🔴 OFF"}`,
+      `Kriteria: pool <b>v4 fee ${(st.feeMinPpm / 10000).toFixed(0)}-${(st.feeMaxPpm / 10000).toFixed(0)}%</b> · vol ≥ $${(st.minVolUsd / 1000).toFixed(0)}k · skor ≥ ${st.minScore}`,
+      `Interval ${st.intervalMin} menit · cooldown ${st.cooldownMin} menit`,
+      st.scans > 0
+        ? `Scan terakhir: ${st.lastScanned} trending → <b>${st.lastFound}</b> kandidat · total ${st.alerts} alert`
+        : `Belum ada scan.`,
+      ``,
+      `<code>/hunt on</code> · <code>/hunt off</code> · <code>/hunt now</code>`,
+    ].join("\n"),
+  );
 }
 
 // ══════════ 📸 profit card ══════════
@@ -1432,12 +1800,46 @@ const AUTOLP_NUM_MAP: Record<string, keyof typeof cfg.autoLp> = {
   alpdaily: "dailyCapEth",
   alpminliq: "minLiqUsd",
   alpmaxtax: "maxTaxPct",
+  alpgrace: "oorGraceMin",
+  alpoorcount: "oorCooldownCount",
+  alpoorhours: "oorCooldownHours",
+};
+const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
+  huntvol: "minVolUsd",
+  huntfees: "minPoolFeesUsd", // #1 fee-yield: min 24h pool fees
+  huntyield: "minFeeYieldPct", // #1 fee-yield: min daily fee/TVL %
+  huntscore: "minScore",
+  huntmcapmin: "screenMinMcap", // mcap floor
+  huntmcapmax: "screenMaxMcap", // mcap ceiling (0 = off) — farm SMALL-cap
 };
 const SET_HELP =
-  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax";
+  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours · alpmode single|inrange · alpclose 0/1";
 
 export async function onSet(text: string): Promise<void> {
   const [, k, v] = text.split(/\s+/);
+  // ── enum / string auto-LP settings (handled BEFORE the numeric guard below) ──
+  if (k === "alpmode") {
+    if (v !== "single" && v !== "inrange") {
+      await send("Pilih: <code>/set alpmode single</code> (rug-safe, parkir quote) atau <code>/set alpmode inrange</code> (both-sided, fee langsung).");
+      return;
+    }
+    cfg.autoLp.mode = v;
+    persist();
+    await send(
+      `✓ autoLp.mode → <b>${v}</b> ${v === "inrange" ? "(both-sided — fee LANGSUNG, tapi pegang token → rug=rugi)" : "(single-side — parkir quote asset, rug-safe)"}`,
+    );
+    return;
+  }
+  if (k === "alpclose") {
+    if (v !== "0" && v !== "1") {
+      await send("Toggle: <code>/set alpclose 1</code> (tutup OOR) / <code>/set alpclose 0</code> (biarin jalan)");
+      return;
+    }
+    cfg.autoLp.closeOor = v === "1";
+    persist();
+    await send(`✓ autoLp.closeOor → ${v === "1" ? "on (tutup posisi OOR)" : "off (posisi dibiarin jalan)"}`);
+    return;
+  }
   if (!k || v == null || isNaN(Number(v))) {
     await send(`Format: <code>/set &lt;key&gt; &lt;angka&gt;</code>\n${SET_HELP}`);
     return;
@@ -1480,6 +1882,12 @@ export async function onSet(text: string): Promise<void> {
     await send(`✓ autoLp.${k} → ${v}`);
     return;
   }
+  if (SCAN_NUM_MAP[k]) {
+    (cfg.scan[SCAN_NUM_MAP[k]] as number) = Number(v);
+    persist();
+    await send(`✓ hunt.${k} → ${v}`);
+    return;
+  }
   await send(`Key nggak dikenal.\n${SET_HELP}`);
 }
 
@@ -1517,6 +1925,7 @@ export const isAwaitingAmount = (): boolean => !!pending?.awaitingAmount;
 export const cancelPending = (): void => {
   pending = null;
   pendingSwap = null;
+  swapFrom = null;
 };
 
 function short(e: unknown, n: number): string {
