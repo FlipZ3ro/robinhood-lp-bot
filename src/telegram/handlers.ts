@@ -100,15 +100,20 @@ export async function onCA(addr: string): Promise<void> {
   try {
     meta = await tokenMeta(addr);
     const { discoverV4UsdgPools } = await import("../chain/v4/discover.js");
+    // Hard-cap each discovery so a single slow source (Blockscout getLogs "suka lama") can't hang the
+    // whole "Cari pool" — after `ms` we use whatever the others returned. The picker still shows the
+    // pools that DID resolve; a laggy source just contributes nothing this round (cache serves next).
+    const to = <T>(p: Promise<T>, ms: number, fb: T): Promise<T> =>
+      Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fb), ms))]);
     // ETH price + DexScreener 24h volume + v2/v3 (WETH) + v3 (USDG) + v4 (ETH) + v4 (USDG) in parallel
     const [px, dex, v2, v3, v3usd, v4, v4usd] = await Promise.all([
       ethUsd().catch(() => 0),
-      dexPairs(addr, Date.now()).catch(() => new Map<string, DexPair>()),
-      readV2Pool(addr).catch(() => null as V2Pool | null),
-      findPools(addr).catch(() => [] as PoolInfo[]),
-      findUsdgPools(addr).catch(() => [] as PoolInfo[]),
-      discoverV4Pools(addr).catch(() => [] as V4Pool[]),
-      discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]),
+      to(dexPairs(addr, Date.now()).catch(() => new Map<string, DexPair>()), 8000, new Map<string, DexPair>()),
+      to(readV2Pool(addr).catch(() => null as V2Pool | null), 8000, null as V2Pool | null),
+      to(findPools(addr).catch(() => [] as PoolInfo[]), 8000, [] as PoolInfo[]),
+      to(findUsdgPools(addr).catch(() => [] as PoolInfo[]), 8000, [] as PoolInfo[]),
+      to(discoverV4Pools(addr).catch(() => [] as V4Pool[]), 8000, [] as V4Pool[]),
+      to(discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]), 8000, [] as V4Pool[]),
     ]);
     // Enrich each pool with DexScreener 24h VOLUME (matched by pool address for v2/v3, by poolId for
     // v4). v4 standing TVL isn't readable on Robinhood (singleton PoolManager → getLiquidity is a
@@ -1976,7 +1981,11 @@ export async function onAddAmount(text: string): Promise<void> {
       await edit(mid, "increase v3 belum didukung (baru v4).");
     }
   } catch (e) {
-    await edit(mid, `❌ Gagal nambah liq: ${short(e, 160)}`);
+    const msg = (e as Error).message || String(e);
+    const friendly = /revert|settle|slippage|CurrencyNotSettled/i.test(msg)
+      ? "harga pool gerak pas settle (pool volatil / fee tinggi). <b>Coba tap ➕ Add lagi</b> — token/USDG yang keburu kebeli di-reuse, biasanya berhasil percobaan ke-2."
+      : short(e, 160);
+    await edit(mid, `❌ Gagal nambah liq: ${friendly}`);
   }
 }
 

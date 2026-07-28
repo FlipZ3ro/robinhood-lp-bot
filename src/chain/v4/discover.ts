@@ -41,17 +41,19 @@ function stateView(): ethers.Contract {
 const v4EthCache = new Map<string, V4Pool[]>();
 const v4UsdCache = new Map<string, V4Pool[]>();
 
-/** Blockscout getLogs with retry — transient empties/timeouts otherwise wipe the pool list. */
-async function getLogsItems(url: string, tries = 3): Promise<any[]> {
+/** Blockscout getLogs with retry — transient empties/timeouts otherwise wipe the pool list. Fail
+ *  FAST (6s, not 20s) so a slow Blockscout doesn't hang "Cari pool" for up to a minute; 2 tries cap
+ *  the worst case at ~12s. Empty is still retried (Blockscout returns flaky empties) but only once. */
+async function getLogsItems(url: string, tries = 2): Promise<any[]> {
   for (let i = 0; i < tries; i++) {
     try {
-      const r: any = await fetch(url, { signal: AbortSignal.timeout(20_000) }).then((x) => x.json());
+      const r: any = await fetch(url, { signal: AbortSignal.timeout(6_000) }).then((x) => x.json());
       const items = Array.isArray(r?.result) ? r.result : [];
       if (items.length) return items;
     } catch {
-      /* retry */
+      /* retry on error/timeout */
     }
-    if (i < tries - 1) await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, 300));
   }
   return [];
 }

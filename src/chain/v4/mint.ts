@@ -500,7 +500,10 @@ export async function openV4UsdgInRange(
   const tickUpper = opts?.range ? opts.range.tickUpper : anchor + half * sp;
 
   // Tight 1% buffer — safe now that state is fresh (re-read → mint is milliseconds); staticCall guards.
-  const slip = new Percent(1, 100);
+  // INCREASE on an existing (often volatile / high-fee, e.g. 10%) pool: the price can move between
+  // build and settle, so give the settle more headroom (5% vs 1% for a fresh open) → far fewer
+  // "reverted" retries. Slightly more leftover (swept → ETH), but the top-up lands instead of failing.
+  const slip = new Percent(opts?.increaseTokenId ? 5 : 1, 100);
   const mk = (a0: bigint, a1: bigint) => Position.fromAmounts({ pool: livePool, tickLower, tickUpper, amount0: a0.toString(), amount1: a1.toString(), useFullPrecision: true });
   let position = mk(bal0, bal1);
   try {
