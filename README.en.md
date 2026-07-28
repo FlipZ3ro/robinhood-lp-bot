@@ -230,9 +230,17 @@ For honeypot tokens that can't be withdrawn (transfer reverts), the bot **force-
 
 > ⚠️ **Note on "Keep token":** the auto-swap on close sweeps your **entire wallet balance of that token**, not just this position's share.
 
+### ➕ Add to an existing position (increase)
+
+Already have a position (e.g. USDG/TACO) and want to **top it up**? In `/list` every v4 position has an **➕ Add** button → type an ETH amount → the bot **swaps ½ token + ½ USDG** and adds it to the **SAME position** (not a new NFT — the SDK emits `INCREASE_LIQUIDITY`). Uses the existing range, grows the PnL basis (LP-vs-HODL stays honest), reuses wallet USDG + sweeps the leftover → ETH. (USDG pairs for now; ETH pairs to follow.)
+
 ### History — `/ledger`
 
 Every closed position (v3 + v4 + v2, newest first), with Next/Back buttons + a 📸 card per position. Combined stats: win rate, capital, LP fees, realized vs stuck.
+
+### 📅 Profit Calendar — `/calendar`
+
+A monthly calendar grid (PNG) — each cell = the **realized PnL of positions closed that day** (LP-vs-HODL, **fees included**). Green profit, red loss, header "X up · Y down" + monthly total. **⬅️ Prev / Next ➡️** buttons switch months. Day boundary **00:00 UTC = 07:00 WIB**. Background is customizable (send a photo to the bot / `assets/card-bg.jpg` / `RH_CARD_BG` — same as the profit cards).
 
 The ledger is reconstructed from **on-chain events** — old positions still show up even if you just installed the bot. USDG pairs use **LP-vs-HODL** accounting (fees + IL, excluding the token's own price move) so the number stays consistent and honest.
 
@@ -269,6 +277,8 @@ Toggles: `/set newtoken 1` · `/set posmon 1` · `/set autoclose 0` · `/set min
 ### Fast-submit — broadcast straight to the sequencer
 
 Set `RH_FAST_SUBMIT=1`. Transactions go directly to the Robinhood sequencer (**AWS us-east-2 / Ohio**), skipping the relay hop. Reads still go through the main RPC; if the sequencer errors, it auto-falls back (no tx is lost). **Biggest impact on a US VPS.** Local + DNS hijack → set `RH_SEQUENCER_IP=3.136.74.196`.
+
+> ⚡ **Fast receipt detection:** Robinhood blocks are sub-second, but ethers polls for receipts every 4s by default → a multi-tx close/add/swap feels slow. The bot sets `pollingInterval` to **350ms** (tunable via `RH_POLL_MS`), so `tx.wait()` returns ~10× faster.
 
 ### LLM + GMGN radar — candidate confirmation layer
 
@@ -321,6 +331,7 @@ The top layer: the bot **finds, opens, and closes positions on its own** — you
 | `/ledger` | Closed-position history (realized vs stuck) + per-position cards |
 | `/pnl` | Lifetime wallet-level PnL |
 | `/card` | Portfolio profit card (shareable PNG) |
+| `/calendar` | 📅 Profit calendar — daily PnL (monthly grid, fees included) |
 | `/swap` | Swap tokens via the KyberSwap aggregator (best route) |
 | `/screen` | GMGN 24h screening (mcap>500k, vol>1M, no flap, utility>meme) · `/screen fast` |
 | `/watch` | Scanner status + current top volume |
@@ -410,6 +421,7 @@ src/
 │   ├── handlers.ts       all commands/buttons (+ /list cache)
 │   ├── menu.ts           persistent reply keyboard
 │   ├── card.ts           profit card PNG (@napi-rs/canvas, STRIX style)
+│   ├── calendar.ts       monthly profit calendar (daily PnL, PNG) + custom bg
 │   ├── notify.ts         spike / new-token / out-of-range alerts
 │   ├── watchLoop.ts      scanner timer
 │   ├── feedLoop.ts       feed monitor lifecycle

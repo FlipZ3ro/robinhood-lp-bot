@@ -232,9 +232,17 @@ Buat token honeypot yang nggak bisa ditarik (transfer revert), bot **force-close
 
 > ⚠️ **Catatan "Simpen token":** auto-swap pas close nyapu **seluruh saldo token di dompet**, bukan cuma dari posisi itu.
 
+### ➕ Tambah liq ke posisi yang ada (increase)
+
+Udah punya posisi (misal USDG/TACO) terus mau **nambahin** liq? Di `/list` tiap posisi v4 ada tombol **➕ Add** → ketik jumlah ETH → bot **swap ½ token + ½ USDG** lalu masuk ke **posisi yang SAMA** (bukan bikin NFT baru — SDK emit `INCREASE_LIQUIDITY`). Pakai range posisi existing, basis PnL ikut nambah (LP-vs-HODL tetep jujur), reuse USDG di wallet + sweep sisa → ETH. (Pair USDG dulu; ETH-pair nyusul.)
+
 ### Riwayat — `/ledger`
 
 Semua posisi ditutup (v3 + v4 + v2, urut terbaru dulu), tombol Next/Back + 📸 kartu per-posisi. Stats gabungan: win rate, modal, fee LP, realized vs nyangkut.
+
+### 📅 Profit Calendar — `/calendar`
+
+Grid kalender bulanan (PNG) — tiap kotak = **PnL realized posisi yang di-close hari itu** (LP-vs-HODL, **fee included**). Ijo profit, merah loss, header "X up · Y down" + total bulan. Tombol **⬅️ Prev / Next ➡️** buat pindah bulan. Hari reset **00:00 UTC = 07:00 WIB**. Background bisa diganti (kirim foto ke bot / `assets/card-bg.jpg` / `RH_CARD_BG` — sama kayak kartu profit).
 
 Ledger direkonstruksi dari **event on-chain** — posisi lama tetep kebaca walau baru install bot-nya. Pair USDG dihitung **LP-vs-HODL** (fee + IL, exclude gerakan harga token) biar konsisten dan jujur.
 
@@ -271,6 +279,8 @@ Toggle: `/set newtoken 1` · `/set posmon 1` · `/set autoclose 0` · `/set mins
 ### Fast-submit — broadcast langsung ke sequencer
 
 Set `RH_FAST_SUBMIT=1`. Tx dikirim langsung ke sequencer Robinhood (**AWS us-east-2 / Ohio**), skip hop relay. Baca tetep via RPC utama; sequencer error → auto fallback (tx nggak ilang). **Paling ngefek di VPS US.** Lokal + DNS hijack → set `RH_SEQUENCER_IP=3.136.74.196`.
+
+> ⚡ **Deteksi receipt cepat:** block Robinhood sub-detik, tapi ethers default nge-poll receipt tiap 4 detik → close/add/swap multi-tx berasa lama. Bot set `pollingInterval` ke **350ms** (tunable `RH_POLL_MS`), jadi `tx.wait()` balik ~10× lebih cepet.
 
 ### Radar LLM + GMGN — layer konfirmasi kandidat
 
@@ -323,6 +333,7 @@ Layer paling atas: bot **cariin, buka, dan tutup posisi sendiri** — lu tinggal
 | `/ledger` | Riwayat posisi ditutup (realized vs nyangkut) + kartu per-posisi |
 | `/pnl` | PnL seumur hidup level dompet |
 | `/card` | Kartu profit portfolio (PNG shareable) |
+| `/calendar` | 📅 Profit calendar — PnL harian (grid bulanan, fee included) |
 | `/swap` | Swap token via KyberSwap aggregator (rute terbaik) |
 | `/screen` | Screening GMGN 24h (mcap>500k, vol>1M, no flap, util>meme) · `/screen fast` |
 | `/watch` | Status scanner + volume tertinggi saat ini |
@@ -412,6 +423,7 @@ src/
 │   ├── handlers.ts       semua command/tombol (+ cache /list)
 │   ├── menu.ts           reply keyboard persisten
 │   ├── card.ts           kartu profit PNG (@napi-rs/canvas, STRIX style)
+│   ├── calendar.ts       profit calendar bulanan (PnL/hari, PNG) + bg custom
 │   ├── notify.ts         notif spike / token baru / out-of-range
 │   ├── watchLoop.ts      timer scanner
 │   ├── feedLoop.ts       lifecycle feed monitor
