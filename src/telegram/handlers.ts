@@ -72,6 +72,8 @@ interface Pending {
   balancedEth?: number; // ETH that balances the held token for a dual-side mint
 }
 let pending: Pending | null = null;
+// "➕ Add" flow — top up an EXISTING position (increase liquidity, not a new NFT)
+let pendingAdd: { tokenId: string; version: "v3" | "v4" } | null = null;
 
 const GAS_RESERVE = 0.0004; // native ETH kept for gas (~4-5 tx at ~0.0001 each)
 const usableEth = (b: { weth: string; eth: string }): number =>
@@ -676,6 +678,7 @@ export async function onList(mid: number | null = null, force = false): Promise<
       const row: object[] = [];
       // only offer Claim when there's fee worth claiming
       if (r.feeUsd > 0.01) row.push({ text: `💰 Claim`, callback_data: `v4f:${r.tokenId}` });
+      row.push({ text: `➕ Add`, callback_data: `add4:${r.tokenId}` });
       row.push({ text: `Close ${r.sym}${idTag}`, callback_data: `v4c:${r.tokenId}` });
       btns.push(row);
     }
@@ -1921,9 +1924,94 @@ export async function onHelp(): Promise<void> {
 }
 
 // per-message pending accessors for bot.ts routing
+// ══════════ ➕ Add — increase an EXISTING position (not a new NFT) ══════════
+
+export async function onAddAsk(tokenId: string, version: "v3" | "v4"): Promise<void> {
+  pending = null; // drop any open-flow so a stray number doesn't mis-route
+  pendingAdd = { tokenId, version };
+  await send(
+    `➕ <b>Tambah liq ke posisi #${tokenId}</b> [${version}]\n` +
+      `Ketik jumlah <b>ETH</b> yang mau ditambahin (contoh: <code>0.005</code>). Bot auto split ½ token + ½ USDG → masuk ke posisi itu (bukan buka baru).`,
+  );
+}
+
+export async function onAddAmount(text: string): Promise<void> {
+  if (!pendingAdd) return;
+  const eth = parseFloat(text);
+  if (!(eth > 0)) {
+    await send("Masukin angka ETH yang bener, contoh: 0.005");
+    return;
+  }
+  const b = await balances().catch(() => null);
+  if (b && eth > usableEth(b) + 1e-9) {
+    await send(`⚠️ Kegedean. Yang bisa di-LP cuma ${usableEth(b).toFixed(5)} ETH.`);
+    return;
+  }
+  if (b && Number(b.eth) < GAS_RESERVE) {
+    await send(`⚠️ ETH native cuma ${Number(b.eth).toFixed(5)} — kurang buat gas (min ${GAS_RESERVE}).`);
+    return;
+  }
+  const { tokenId, version } = pendingAdd;
+  pendingAdd = null;
+  const amt = toEthStr(eth) ?? String(eth);
+  invalidateListCache();
+  const m = await send(`⏳ <b>Nambah ${amt} ETH ke posisi #${tokenId}…</b> (swap ½+½ → increase)`);
+  const mid = m?.result?.message_id;
+  try {
+    if (version === "v4") {
+      const { increaseV4Position } = await import("../chain/v4/mint.js");
+      const r = await increaseV4Position(tokenId, amt);
+      await edit(
+        mid,
+        [
+          `✅ <b>Liq masuk ke #${tokenId}</b> [v4] · pool fee ${(r.fee / 10000).toFixed(2)}%`,
+          r.swapHash ? `swap ½+½: <a href="${explorerTx(r.swapHash)}">tx</a>` : "",
+          `deposit <b>+${amt}Ξ</b> (masuk ke posisi lama, bukan #baru)`,
+          `tx: <a href="${explorerTx(r.txHash)}">tx</a>`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      );
+    } else {
+      await edit(mid, "increase v3 belum didukung (baru v4).");
+    }
+  } catch (e) {
+    await edit(mid, `❌ Gagal nambah liq: ${short(e, 160)}`);
+  }
+}
+
+export const isAwaitingAdd = (): boolean => !!pendingAdd;
+
+// ══════════ 📅 Profit Calendar ══════════
+
+export async function onCalendar(year?: number, month0?: number): Promise<void> {
+  const now = new Date();
+  const y = year ?? now.getUTCFullYear();
+  const m = month0 ?? now.getUTCMonth();
+  try {
+    const { renderCalendar } = await import("./calendar.js");
+    const png = await renderCalendar(y, m);
+    const prev = m === 0 ? [y - 1, 11] : [y, m - 1];
+    const next = m === 11 ? [y + 1, 0] : [y, m + 1];
+    await sendPhoto(png, "📅 <b>Profit Calendar</b> — tiap kotak = PnL posisi yang di-close hari itu (fee included). Reset 07:00 WIB.", {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "⬅️ Prev", callback_data: `cal:${prev[0]}:${prev[1]}` },
+            { text: "Next ➡️", callback_data: `cal:${next[0]}:${next[1]}` },
+          ],
+        ],
+      },
+    });
+  } catch (e) {
+    await send(`❌ Calendar gagal: ${short(e, 120)}`);
+  }
+}
+
 export const isAwaitingAmount = (): boolean => !!pending?.awaitingAmount;
 export const cancelPending = (): void => {
   pending = null;
+  pendingAdd = null;
   pendingSwap = null;
   swapFrom = null;
 };

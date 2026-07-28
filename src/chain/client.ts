@@ -46,7 +46,12 @@ export const provider: ethers.JsonRpcProvider = env.fastSubmit
   ? new SequencerRoutingProvider(env.rpcUrl, cfg.chainId)
   : new ethers.JsonRpcProvider(env.rpcUrl, cfg.chainId);
 
-if (env.fastSubmit) log.info(`fast-submit ON → ${env.sequencerUrl}${env.sequencerIp ? ` @${env.sequencerIp}` : ""}`);
+// Robinhood blocks are SUB-SECOND, but ethers' default pollingInterval is 4s → tx.wait() only
+// notices a mined receipt on the next 4s poll. A multi-tx close/add/swap (5 txs) then wastes up to
+// ~20s just polling, even though each tx lands instantly. Poll fast so tx.wait() returns quickly.
+provider.pollingInterval = Number(process.env.RH_POLL_MS) || 350;
+
+if (env.fastSubmit) log.info(`fast-submit ON → ${env.sequencerUrl}${env.sequencerIp ? ` @${env.sequencerIp}` : ""} · poll ${provider.pollingInterval}ms`);
 
 export const usingOwnWatchRpc = !!env.watchRpcUrl;
 export const watchProvider = env.watchRpcUrl

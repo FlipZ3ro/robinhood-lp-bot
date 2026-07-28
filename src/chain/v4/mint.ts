@@ -17,8 +17,8 @@ import { tokenMeta } from "../tokens.js";
 import { discoverV4Pools, pickV4Pool, USDG, type V4Pool } from "./discover.js";
 import { swapEthToTokenV4, quoteV4 } from "./swap.js";
 import { kyberSwap, kyberEnabled, KYBER_NATIVE } from "../kyber.js";
-import { NATIVE } from "./poolkey.js";
-import { STATEVIEW_ABI } from "./abis.js";
+import { NATIVE, computePoolId, type PoolKey } from "./poolkey.js";
+import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { mapLimit } from "../blockscout.js";
 import { WETH_ABI } from "../abis.js";
 import { ethUsd } from "../price.js";
@@ -421,7 +421,11 @@ async function approveViaPermit2(tokenAddr: string): Promise<void> {
  * ETH via the KyberSwap aggregator (ETH→USDG and ETH→token, auto multi-hop), approves both via
  * Permit2, then mints both-sided. amountEthStr = ETH budget deployed.
  */
-export async function openV4UsdgInRange(pool: V4Pool, amountEthStr: string): Promise<V4OpenResult & { swapHash?: string; swappedPct: number }> {
+export async function openV4UsdgInRange(
+  pool: V4Pool,
+  amountEthStr: string,
+  opts?: { increaseTokenId?: string; range?: { tickLower: number; tickUpper: number } },
+): Promise<V4OpenResult & { swapHash?: string; swappedPct: number }> {
   const w = wallet();
   const total = ethers.parseEther(amountEthStr);
   await ensureNativeEth(total + NATIVE_GAS_BUFFER);
@@ -490,9 +494,10 @@ export async function openV4UsdgInRange(pool: V4Pool, amountEthStr: string): Pro
     /* keep discovery-time state on a read failure */
   }
   const livePool = new Pool(cur0, cur1, pool.fee, pool.tickSpacing, pool.poolKey.hooks, liveSqrt.toString(), liveLiq.toString(), liveTick);
+  // INCREASE mode: reuse the EXISTING position's range (must match the NFT exactly). Open mode: fresh anchor.
   const anchor = Math.floor(liveTick / sp) * sp;
-  const tickLower = anchor - half * sp;
-  const tickUpper = anchor + half * sp;
+  const tickLower = opts?.range ? opts.range.tickLower : anchor - half * sp;
+  const tickUpper = opts?.range ? opts.range.tickUpper : anchor + half * sp;
 
   // Tight 1% buffer — safe now that state is fresh (re-read → mint is milliseconds); staticCall guards.
   const slip = new Percent(1, 100);
@@ -511,8 +516,9 @@ export async function openV4UsdgInRange(pool: V4Pool, amountEthStr: string): Pro
   }
   if (position.liquidity.toString() === "0") throw new Error("liquidity 0 — deposit terlalu kecil");
 
+  // INCREASE mode → target the existing NFT (SDK emits INCREASE_LIQUIDITY). Open mode → mint to recipient.
   const { calldata, value } = V4PositionManager.addCallParameters(position, {
-    recipient: w.address,
+    ...(opts?.increaseTokenId ? { tokenId: opts.increaseTokenId } : { recipient: w.address }),
     slippageTolerance: slip,
     deadline: Math.floor(Date.now() / 1000 + 600).toString(),
     // NO useNative — both sides are ERC20 (token + USDG), settled via Permit2
@@ -520,30 +526,74 @@ export async function openV4UsdgInRange(pool: V4Pool, amountEthStr: string): Pro
   try {
     await provider.call({ to: C.v4PositionManager!, data: calldata, value, from: w.address });
   } catch (e) {
-    throw new Error(`simulasi mint v4 USDG revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
+    throw new Error(`simulasi ${opts?.increaseTokenId ? "increase" : "mint"} v4 USDG revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
   }
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
   const rc = await tx.wait();
-  const tokenId = tokenIdFromReceipt(rc!);
+  const tokenId = opts?.increaseTokenId ?? tokenIdFromReceipt(rc!);
   if (tokenId) {
-    // record the DEPOSITED token amounts so close can measure LP-vs-HODL (fees+IL), not the
-    // token's directional price move which isn't the LP's fault.
+    // record DEPOSITED amounts (LP-vs-HODL basis). On INCREASE, ADD to the existing record so the
+    // basis grows by exactly what we topped up (PnL stays honest across top-ups).
+    const add0 = BigInt(position.amount0.quotient.toString());
+    const add1 = BigInt(position.amount1.quotient.toString());
+    const prev = opts?.increaseTokenId ? loadV4Deposit(tokenId) : null;
     saveV4Deposit(tokenId, {
-      depositWei: total.toString(),
-      ts: Date.now(),
+      depositWei: ((prev?.depositWei ? BigInt(prev.depositWei) : 0n) + total).toString(),
+      ts: prev?.ts ?? Date.now(),
       poolId: pool.poolId,
       fee: pool.fee,
       tickLower,
       tickUpper,
       mode: "inrange",
-      dep0: position.amount0.quotient.toString(),
-      dep1: position.amount1.quotient.toString(),
+      dep0: ((prev?.dep0 ? BigInt(prev.dep0) : 0n) + add0).toString(),
+      dep1: ((prev?.dep1 ? BigInt(prev.dep1) : 0n) + add1).toString(),
     });
   }
   // sweep the un-deposited leftover (token AND/OR USDG) → ETH so there's no "sisa" (v4 doesn't refund)
   await sweepLeftoverToEth([{ addr: c0, dec: m0.decimals }, { addr: c1, dec: m1.decimals }]).catch(() => undefined);
-  log.info(`open v4 USDG in-range #${tokenId} ${m0.symbol}/${m1.symbol} fee ${pool.fee / 10000}% ${amountEthStr}Ξ`);
+  log.info(`${opts?.increaseTokenId ? "increase" : "open"} v4 USDG in-range #${tokenId} ${m0.symbol}/${m1.symbol} fee ${pool.fee / 10000}% ${opts?.increaseTokenId ? "+" : ""}${amountEthStr}Ξ`);
   return { tokenId, txHash: tx.hash, swapHash, swappedPct: 100, fee: pool.fee, tickLower, tickUpper, depositEth: amountEthStr, poolId: pool.poolId };
+}
+
+/**
+ * Add liquidity to an EXISTING v4 position (INCREASE, not a new NFT). Reconstructs the pool + range
+ * from the tokenId, then reuses the in-range open path (fund both sides by the range split, reuse
+ * held USDG, sweep leftover → ETH) but targets the existing tokenId → the SDK emits INCREASE_LIQUIDITY.
+ * USDG pairs only for now (all the bot's positions are USDG); ETH pairs throw a clear message.
+ */
+export async function increaseV4Position(tokenId: string, amountEthStr: string): Promise<V4OpenResult & { swapHash?: string; swappedPct: number }> {
+  const posm = new ethers.Contract(C.v4PositionManager!, V4_POSM_ABI, provider);
+  const [pk, infoRaw] = await posm.getPoolAndPositionInfo!(tokenId);
+  const info = BigInt(infoRaw);
+  const s24 = (v: number): number => (v >= 0x800000 ? v - 0x1000000 : v);
+  const tickLower = s24(Number((info >> 8n) & 0xffffffn));
+  const tickUpper = s24(Number((info >> 32n) & 0xffffffn));
+  const poolKey: PoolKey = {
+    currency0: String(pk.currency0),
+    currency1: String(pk.currency1),
+    fee: Number(pk.fee),
+    tickSpacing: Number(pk.tickSpacing),
+    hooks: String(pk.hooks),
+  };
+  const usdgIs = poolKey.currency0.toLowerCase() === USDG.toLowerCase() || poolKey.currency1.toLowerCase() === USDG.toLowerCase();
+  if (!usdgIs) throw new Error("increase pair ETH belum didukung — sekarang cuma pair USDG (close & buka lagi buat ETH-pair).");
+  const poolId = computePoolId(poolKey);
+  const sv = new ethers.Contract(C.v4StateView!, STATEVIEW_ABI, provider);
+  const s0 = await sv.getSlot0!(poolId);
+  if (!(s0.sqrtPriceX96 > 0n)) throw new Error("state pool posisi ini gak kebaca");
+  const liquidity: bigint = await sv.getLiquidity!(poolId).catch(() => 0n);
+  const pool: V4Pool = {
+    poolKey,
+    poolId,
+    fee: poolKey.fee,
+    tickSpacing: poolKey.tickSpacing,
+    sqrtPriceX96: BigInt(s0.sqrtPriceX96),
+    tick: Number(s0.tick),
+    liquidity,
+    lpFee: poolKey.fee,
+    quote: "usd",
+  };
+  return openV4UsdgInRange(pool, amountEthStr, { increaseTokenId: tokenId, range: { tickLower, tickUpper } });
 }
 
 /**

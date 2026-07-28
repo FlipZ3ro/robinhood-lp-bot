@@ -48,7 +48,7 @@ function bgImagePath(): string | null {
   const cands = [process.env.RH_CARD_BG, "assets/card-bg.jpg", "assets/card-bg.png", "assets/card-bg.jpeg"].filter(Boolean) as string[];
   return cands.find((p) => existsSync(p)) ?? null;
 }
-async function loadBg(): Promise<Image | null> {
+export async function loadBg(): Promise<Image | null> {
   const p = bgImagePath();
   if (!p) return null;
   try {
@@ -58,7 +58,7 @@ async function loadBg(): Promise<Image | null> {
   }
 }
 /** Draw an image cover-fit (fill the canvas, crop overflow). */
-function drawCover(g: SKRSContext2D, img: Image, W: number, H: number): void {
+export function drawCover(g: SKRSContext2D, img: Image, W: number, H: number): void {
   const s = Math.max(W / img.width, H / img.height);
   const w = img.width * s;
   const h = img.height * s;

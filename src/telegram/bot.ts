@@ -36,6 +36,10 @@ async function routeCallback(cq: any): Promise<void> {
   if (d === "screen") return H.onScreen();
   if (d === "card") return H.onCard();
   if (d.startsWith("cardp:")) return H.onCardFor(d.slice(6));
+  if (d.startsWith("cal:")) {
+    const p = d.split(":");
+    return H.onCalendar(Number(p[1]), Number(p[2])); // 📅 prev/next month
+  }
   if (d === "swapdo") return H.onSwapDo(mid);
   if (d === "swap") return H.onSwap("/swap"); // 🔙 back to token menu
   if (d.startsWith("swf:")) return H.onSwapFrom(d.slice(4), mid); // pick token to sell
@@ -53,6 +57,8 @@ async function routeCallback(cq: any): Promise<void> {
     return;
   }
   if (d.startsWith("v4f:")) return H.onV4Collect(d.split(":")[1]!);
+  if (d.startsWith("add4:")) return H.onAddAsk(d.slice(5), "v4"); // ➕ tambah liq ke posisi v4 existing
+  if (d.startsWith("add3:")) return H.onAddAsk(d.slice(5), "v3");
   if (d.startsWith("v4c:")) return H.onV4Close("/v4close " + d.split(":")[1]);
   if (d.startsWith("v2c:")) return H.onV2Close(d.slice(4));
   if (d.startsWith("close:")) return H.onCloseAsk(d.split(":")[1]!, mid);
@@ -86,6 +92,7 @@ async function routeMessage(m: any): Promise<void> {
   if (t === "/scan") return H.onScan();
   if (t.startsWith("/hunt")) return H.onHunt(t.split(/\s+/)[1]);
   if (t === "/card") return H.onCard();
+  if (t === "/calendar") return H.onCalendar();
   if (t.startsWith("/swap")) return H.onSwap(t);
   if (t.startsWith("/screen")) return H.onScreen(t.split(/\s+/)[1]);
   if (t.startsWith("/watch")) return H.onWatch(t.split(/\s+/)[1]);
@@ -102,6 +109,7 @@ async function routeMessage(m: any): Promise<void> {
   if (t === "/settings") return H.onSettings();
   if (t.startsWith("/set ")) return H.onSet(t);
   if (CA_RE.test(t)) return H.onCA(t);
+  if (H.isAwaitingAdd() && NUM_RE.test(t)) return H.onAddAmount(t); // ➕ add-liq amount
   if (H.isAwaitingAmount() && NUM_RE.test(t)) return H.onAmount(t);
   if (t.startsWith("/")) return; // unknown command
   await send("Paste alamat kontrak token (0x… 40 hex) buat buka LP.");
@@ -127,6 +135,7 @@ async function registerCommands(): Promise<void> {
       { command: "screen", description: "🧪 Screening GMGN 24h (mcap>500k, vol>1M, no flap)" },
       { command: "hunt", description: "🎯 Hunter kandidat LP (fee 3-5% + rame + screening)" },
       { command: "card", description: "📸 Kartu profit shareable (portfolio)" },
+      { command: "calendar", description: "📅 Profit calendar harian (PnL per hari)" },
       { command: "swap", description: "🔄 Swap token via KyberSwap (rute terbaik)" },
       { command: "auto", description: "🤖 Auto-LP (radar → buka otomatis)" },
       { command: "v4", description: "🦄 Cek pool Uniswap v4 sebuah token CA" },
