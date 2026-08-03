@@ -59,6 +59,19 @@ const reasonWord: Record<string, string> = {
   manual: "manual",
 };
 
+// The message is sent parse_mode=HTML, but the LLM answers in Markdown (**bold**). Escape first (so
+// any < > & in the model text can't break the HTML parse), THEN promote the markdown it actually
+// emits to Telegram HTML tags — otherwise the raw ** / # / ` markers leak into the message.
+function mdToHtml(raw: string): string {
+  let s = esc(raw.trim());
+  s = s.replace(/\*\*(.+?)\*\*/gs, "<b>$1</b>"); // **bold**
+  s = s.replace(/__(.+?)__/gs, "<b>$1</b>"); // __bold__
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>"); // `code`
+  s = s.replace(/^\s{0,3}#{1,6}\s+/gm, ""); // drop "# " headings (labels already carry emoji)
+  s = s.replace(/^\s*[-*•]\s+/gm, "• "); // normalize bullets
+  return s.replace(/\n{3,}/g, "\n\n"); // collapse big gaps
+}
+
 // WIB (UTC+7) calendar date/time — used for the 07:00 trigger + the header stamp.
 function wibParts() {
   const w = new Date(Date.now() + 7 * 3_600_000);
@@ -191,11 +204,13 @@ async function briefLlm(dataBlock: string): Promise<string | null> {
     "Kamu analis kuantitatif buat bot liquidity-provider (LP) di DEX Uniswap v4 (chain Robinhood). " +
     "Bot auto-hunt token, buka LP di pool fee tinggi (3-5%), lalu auto-close pas take-profit (TP), stop-loss (SL), " +
     "keluar-range (OOR), atau volume-fade (VFADE). Kamu dikasih ringkasan aktivitas 24 jam terakhir + config strategi. " +
-    "Tulis analisa SINGKAT & TAJAM dalam Bahasa Indonesia gaya operator (lo/gue boleh), bukan formal, tanpa markdown heading:\n" +
-    "1) Yang PROFIT: kenapa profit, apakah entry/range-nya udah pas.\n" +
-    "2) Yang LOSS: kenapa loss — apakah kita salah pasang posisi? (entry telat pas volume udah puncak? range kesempitan jadi cepet OOR? token-nya emang jelek/rug?). Jujur, jangan sok positif.\n" +
-    "3) SATU perubahan config paling berdampak buat besok biar makin pintar (sebut knob + angka konkret).\n" +
-    "Pakai nama token & angka nyata dari data. Maksimal ~180 kata. Langsung insight, jangan ngulang data mentah.";
+    "Tulis analisa SINGKAT & TAJAM dalam Bahasa Indonesia gaya operator (lo/gue boleh), bukan formal.\n" +
+    "Format PERSIS 3 bagian, tiap bagian 1 paragraf pendek, MULAI dengan label diapit **...** :\n" +
+    "**💚 CUAN** — kenapa yang profit itu profit, entry/range-nya udah pas apa belum.\n" +
+    "**🩸 LOSS** — kenapa yang loss itu loss: apakah kita salah pasang posisi? (entry telat pas volume udah puncak? range kesempitan jadi cepet OOR? token emang jelek/rug?). Jujur, jangan sok positif.\n" +
+    "**🔧 FIX** — SATU perubahan config paling berdampak buat besok (sebut knob + angka konkret).\n" +
+    "Boleh **tebalin** nama token/angka penting. JANGAN pakai heading markdown (#) atau tag HTML. " +
+    "Pakai angka & nama token nyata dari data. Total maksimal ~180 kata, langsung insight, jangan ngulang data mentah.";
   const body = JSON.stringify({
     model: env.briefModel,
     messages: [
@@ -305,7 +320,7 @@ export async function buildBriefing(): Promise<string> {
 
   H.push("");
   H.push("🧠 <b>ANALISA</b>" + (env.briefKey ? "" : " <i>(rule-based)</i>") + ":");
-  H.push(esc(analysis));
+  H.push(mdToHtml(analysis));
 
   return H.join("\n");
 }
