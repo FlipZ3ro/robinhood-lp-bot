@@ -35,7 +35,6 @@ const dur = (ms: number | null) => {
   return `${(h / 24).toFixed(1)}h`;
 };
 const clip = (s: string, n = 24) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
-const reasonEmoji: Record<string, string> = { TP: "🎯", SL: "🛑", OOR: "↔️", VFADE: "📉", manual: "✋" };
 
 // Ledger entries closed BEFORE the `reason` field existed default to "manual". Infer a meaningful
 // close reason from the realized PnL vs the configured TP/SL bands so historical days still read
@@ -51,25 +50,18 @@ function effReason(e: LedgerEntry): "TP" | "SL" | "OOR" | "VFADE" | "manual" {
   if (Math.abs(p) < 1.5) return "OOR"; // near-breakeven exit ≈ range/volume close
   return e.reason ?? "manual";
 }
-const reasonWord: Record<string, string> = {
-  TP: "take-profit",
-  SL: "stop-loss",
-  OOR: "out-of-range",
-  VFADE: "volume-fade",
-  manual: "manual",
-};
-
-// The message is sent parse_mode=HTML, but the LLM answers in Markdown (**bold**). Escape first (so
-// any < > & in the model text can't break the HTML parse), THEN promote the markdown it actually
-// emits to Telegram HTML tags — otherwise the raw ** / # / ` markers leak into the message.
-function mdToHtml(raw: string): string {
-  let s = esc(raw.trim());
-  s = s.replace(/\*\*(.+?)\*\*/gs, "<b>$1</b>"); // **bold**
-  s = s.replace(/__(.+?)__/gs, "<b>$1</b>"); // __bold__
-  s = s.replace(/`([^`]+)`/g, "<code>$1</code>"); // `code`
-  s = s.replace(/^\s{0,3}#{1,6}\s+/gm, ""); // drop "# " headings (labels already carry emoji)
-  s = s.replace(/^\s*[-*•]\s+/gm, "• "); // normalize bullets
-  return s.replace(/\n{3,}/g, "\n\n"); // collapse big gaps
+// The analysis renders as a clean MONOSPACE block (<pre>) — reads like a terminal log. The LLM
+// answers in Markdown, and bold can't nest inside <pre>, so strip the markers (keep the emoji
+// section labels) and escape < > & so the content can't break the HTML parse.
+function analysisMono(raw: string): string {
+  const s = raw
+    .trim()
+    .replace(/\*\*(.+?)\*\*/gs, "$1") // drop **bold** markers (no bold inside <pre>)
+    .replace(/__(.+?)__/gs, "$1")
+    .replace(/`([^`]+)`/g, "$1") // drop `code` backticks
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "") // drop "# " headings
+    .replace(/\n{3,}/g, "\n\n"); // collapse big gaps
+  return "<pre>" + esc(s) + "</pre>";
 }
 
 // WIB (UTC+7) calendar date/time — used for the 07:00 trigger + the header stamp.
@@ -295,17 +287,46 @@ export async function buildBriefing(): Promise<string> {
   H.push(`📊 <b>Open:</b> ${d.openCount} · nilai $${d.openValUsd.toFixed(0)} · unreal ${esc(usd(d.openUnrealUsd))}${d.openOor ? ` · <b>${d.openOor} OOR</b>` : ""}`);
   H.push(`🏆 <b>Lifetime:</b> ${d.life.count} trade · ${d.life.winRate.toFixed(0)}% win · ${esc(usd(d.life.pnlUsd))}`);
 
-  // per-position 24h close list
+  // per-position 24h closes — GROUPED by reason (with breathing room between groups) so it isn't a
+  // dense wall; the flat "dead-pool" OOR parks (usually ~$0, same token 3×) collapse to one line.
   H.push("");
-  H.push("📕 <b>DITUTUP 24 JAM:</b>");
+  H.push(`📕 <b>DITUTUP 24 JAM</b> · ${d.closes.length} pos`);
   if (!d.closes.length) {
     H.push("   <i>— gak ada —</i>");
   } else {
-    for (const e of d.closes.slice(0, 15)) {
-      const r = e.reason ?? "manual";
-      H.push(`${reasonEmoji[r] || "•"} <b>${esc(clip(e.pair || e.sym, 26))}</b> ${esc(pctS(e.pnlPct))} (${esc(usd(e.pnlUsd ?? 0))}) · ${esc(dur(e.heldMs))} · <i>${esc(reasonWord[r] || r)}</i>`);
+    const groups: [string, string, NonNullable<LedgerEntry["reason"]>][] = [
+      ["🎯", "TAKE-PROFIT", "TP"],
+      ["🛑", "STOP-LOSS", "SL"],
+      ["📉", "VOLUME-FADE", "VFADE"],
+      ["✋", "MANUAL", "manual"],
+    ];
+    for (const [emo, label, reason] of groups) {
+      const g = d.closes.filter((e) => e.reason === reason);
+      if (!g.length) continue;
+      H.push("");
+      H.push(`${emo} <b>${label}</b> · ${g.length}`);
+      for (const e of g.slice(0, 8)) {
+        H.push(`   <code>${esc(clip(e.pair || e.sym, 22))}</code>  ${esc(pctS(e.pnlPct))} · ${esc(usd(e.pnlUsd ?? 0))} · ${esc(dur(e.heldMs))}`);
+      }
+      if (g.length > 8) H.push(`   <i>…+${g.length - 8} lagi</i>`);
     }
-    if (d.closes.length > 15) H.push(`   <i>…+${d.closes.length - 15} lagi</i>`);
+    // OOR cluster → one collapsed line (token×count + total pnl) instead of many repeated ~$0 rows
+    const oor = d.closes.filter((e) => e.reason === "OOR");
+    if (oor.length) {
+      const cnt: Record<string, number> = {};
+      for (const e of oor) {
+        const nm = (e.pair || e.sym).split("/").find((x) => x !== "USDG" && x !== "ETH" && x !== "WETH") || (e.pair || e.sym);
+        cnt[nm] = (cnt[nm] || 0) + 1;
+      }
+      const names = Object.entries(cnt)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([n, c]) => (c > 1 ? `${clip(n, 12)}×${c}` : clip(n, 12)));
+      const oorPnl = oor.reduce((s, e) => s + (e.pnlUsd ?? 0), 0);
+      H.push("");
+      H.push(`↔️ <b>OUT-OF-RANGE</b> · ${oor.length} · ${esc(usd(oorPnl))}`);
+      H.push(`   <i>${esc(names.join(", "))}${Object.keys(cnt).length > names.length ? "…" : ""} — range mati, ~0 fee</i>`);
+    }
   }
 
   // open positions snapshot (compact)
@@ -320,7 +341,7 @@ export async function buildBriefing(): Promise<string> {
 
   H.push("");
   H.push("🧠 <b>ANALISA</b>" + (env.briefKey ? "" : " <i>(rule-based)</i>") + ":");
-  H.push(mdToHtml(analysis));
+  H.push(analysisMono(analysis));
 
   return H.join("\n");
 }
