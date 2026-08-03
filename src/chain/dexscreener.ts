@@ -18,6 +18,9 @@ export interface DexPair {
   liqUsd: number; // DexScreener's liquidity — accurate for v2/v3, ~0 for v4 on Robinhood
   dexId: string;
   version: string; // "v2" | "v3" | "v4" | ""
+  chgH1: number; // % price change 1h (signed) — volatility signal for adaptive range width
+  chgH6: number; // % price change 6h (signed)
+  volH1: number; // 1h volume ($) — spike/fade signal (recent activity vs 24h average)
 }
 
 const cache = new Map<string, { at: number; map: Map<string, DexPair> }>();
@@ -42,6 +45,9 @@ export async function dexPairs(token: string, now: number): Promise<Map<string, 
         liqUsd: Number(p.liquidity?.usd ?? 0),
         dexId: String(p.dexId ?? ""),
         version: (p.labels ?? []).find((l: string) => /^v[234]$/.test(String(l).toLowerCase())) ?? "",
+        chgH1: Number(p.priceChange?.h1 ?? 0),
+        chgH6: Number(p.priceChange?.h6 ?? 0),
+        volH1: Number(p.volume?.h1 ?? 0),
       });
     }
   } catch (e) {

@@ -4,7 +4,7 @@ import { tokenMeta } from "../chain/tokens.js";
 import { findPools, findUsdgPools, USDG } from "../chain/pools.js";
 import { dexPairs, type DexPair } from "../chain/dexscreener.js";
 import { discoverV4Pools, type V4Pool } from "../chain/v4/discover.js";
-import { readV2Pool, type V2Pool } from "../chain/v2/pair.js";
+import { type V2Pool } from "../chain/v2/pair.js";
 import { previewRange, openPosition, openV3UsdgInRange, openV3UsdgSingleSide, listPositions, closePosition } from "../chain/positions.js";
 import { readLedger, ledgerSummary, backfillLedger } from "../chain/ledger.js";
 import { lifetimePnl } from "../chain/analytics.js";
@@ -20,13 +20,17 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { ethers } from "ethers";
 import { esc, pre, padR, padL, sg, money, tokenEmoji } from "./format.js";
 import { fmtMcap, fmtAge } from "../util/format.js";
+import { logger } from "../util/log.js";
 import type { PoolInfo, TokenMeta, MintMode } from "../types.js";
+
+const log = logger("handlers");
 
 /** Unified candidate pool across Uniswap versions (v2 + v3 + v4). */
 interface UPool {
   version: "v2" | "v3" | "v4";
   fee: number;
   liqLabel: string; // display, e.g. "ETH · liq $18k · vol $127k"
+  asset: string; // quote side: WETH | USDG | ETH — for the "TOKEN/asset" pair name
   tvl: number; // effective liquidity (USD) = max(on-chain estimate, DexScreener liq)
   vol: number; // 24h volume (USD) from DexScreener — the high-fee-farming signal
   v2?: V2Pool;
@@ -94,27 +98,39 @@ const toEthStr = (n: number): string | null => {
 // ══════════ open flow ══════════
 
 export async function onCA(addr: string): Promise<void> {
-  await send(`🔎 <b>Cari pool v2 + v3 + v4</b> di Robinhood Chain\n<code>${addr}</code>`);
+  await send(`🔎 <b>Cari pool v3 + v4</b> di Robinhood Chain\n<code>${addr}</code>`);
   let meta: TokenMeta;
   const all: UPool[] = [];
+  // Hard-cap each read so one slow/unresponsive source (a stalled RPC, Blockscout getLogs "suka
+  // lama", or a price API) can't hang the whole "Cari pool" — after `ms` we use the fallback. The
+  // underlying promise keeps running, so nothing bad gets cached on our side.
+  let timedOut = false; // a source hit its cap → the "no pool" result may be a false negative (RPC slow)
+  const to = <T>(p: Promise<T>, ms: number, fb: T): Promise<T> =>
+    Promise.race([p, new Promise<T>((r) => setTimeout(() => { timedOut = true; r(fb); }, ms))]);
   try {
-    meta = await tokenMeta(addr);
+    // tokenMeta drives token decimals for LP math, so we can't proceed on a guess. It was previously
+    // awaited UNGUARDED here — a stalled RPC read froze the flow right after the "Cari pool" message
+    // (ethers only aborts an RPC after minutes). Cap it; on timeout, bail with a retry hint.
+    const m = await to(tokenMeta(addr).catch(() => null), 8000, null);
+    if (!m) {
+      await send(`⌛ RPC lambat — metadata token belum kebaca. Paste ulang sebentar lagi.`);
+      return;
+    }
+    meta = m;
     const { discoverV4UsdgPools } = await import("../chain/v4/discover.js");
-    // Hard-cap each discovery so a single slow source (Blockscout getLogs "suka lama") can't hang the
-    // whole "Cari pool" — after `ms` we use whatever the others returned. The picker still shows the
-    // pools that DID resolve; a laggy source just contributes nothing this round (cache serves next).
-    const to = <T>(p: Promise<T>, ms: number, fb: T): Promise<T> =>
-      Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fb), ms))]);
-    // ETH price + DexScreener 24h volume + v2/v3 (WETH) + v3 (USDG) + v4 (ETH) + v4 (USDG) in parallel
-    const [px, dex, v2, v3, v3usd, v4, v4usd] = await Promise.all([
-      ethUsd().catch(() => 0),
+    // ETH price + DexScreener 24h volume + v3 (WETH) + v3 (USDG) + v4 (ETH) + v4 (USDG) in parallel.
+    // v2 dropped — fee 0.30% only, not part of the high-fee farming strategy (and it was a slow leg).
+    const [px, dex, v3, v3usd, v4, v4usd] = await Promise.all([
+      to(ethUsd().catch(() => 0), 8000, 0),
       to(dexPairs(addr, Date.now()).catch(() => new Map<string, DexPair>()), 8000, new Map<string, DexPair>()),
-      to(readV2Pool(addr).catch(() => null as V2Pool | null), 8000, null as V2Pool | null),
       to(findPools(addr).catch(() => [] as PoolInfo[]), 8000, [] as PoolInfo[]),
       to(findUsdgPools(addr).catch(() => [] as PoolInfo[]), 8000, [] as PoolInfo[]),
-      to(discoverV4Pools(addr).catch(() => [] as V4Pool[]), 8000, [] as V4Pool[]),
-      to(discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]), 8000, [] as V4Pool[]),
+      // v4 = the focus. RPC getLogs (cache-first, usually <1s); give a COLD full-range scan generous
+      // room to finish so pools aren't missed ("tidak terdeteksi semua") by a premature timeout.
+      to(discoverV4Pools(addr).catch(() => [] as V4Pool[]), 22000, [] as V4Pool[]),
+      to(discoverV4UsdgPools(addr).catch(() => [] as V4Pool[]), 22000, [] as V4Pool[]),
     ]);
+    log.info(`Cari pool ${meta.symbol}: v3 ${v3.length + v3usd.length} · v4 ${v4.length + v4usd.length} · dex ${dex.size}${timedOut ? " · ⚠️TIMEOUT" : ""}`);
     // Enrich each pool with DexScreener 24h VOLUME (matched by pool address for v2/v3, by poolId for
     // v4). v4 standing TVL isn't readable on Robinhood (singleton PoolManager → getLiquidity is a
     // dust snapshot, DexScreener reads $0), so VOLUME is the real high-fee-farming signal.
@@ -123,9 +139,8 @@ export async function onCA(addr: string): Promise<void> {
       const liq = d && d.liqUsd > 0 ? d.liqUsd : est; // DexScreener liq accurate for v2/v3; on-chain estimate for v4
       const vol = d?.vol24h ?? 0;
       const label = vol > 0 ? `${asset} · liq ${fmtUsdShort(liq)} · vol ${fmtUsdShort(vol)}` : `${asset} · liq ${fmtUsdShort(liq)}`;
-      all.push({ version, fee, tvl: Math.max(est, d?.liqUsd ?? 0), vol, liqLabel: label, ...extra });
+      all.push({ version, fee, asset, tvl: Math.max(est, d?.liqUsd ?? 0), vol, liqLabel: label, ...extra });
     };
-    if (v2) mk("v2", 3000, "WETH", 2 * v2.wethInPool * px, v2.pair, { v2 });
     for (const p of v3) mk("v3", p.fee, "WETH", 2 * p.wethInPool * px, p.pool, { v3: p });
     for (const p of v3usd) mk("v3", p.fee, "USDG", 2 * (p.usdgInPool ?? 0), p.pool, { v3: p });
     // NO `liquidity > 0` gate: v4 active-L is a JIT snapshot that flips to 0 between blocks, which
@@ -138,7 +153,11 @@ export async function onCA(addr: string): Promise<void> {
     return;
   }
   if (!all.length) {
-    await send(`⚠️ Tidak ada pool ${esc(meta.symbol)} (v2/v3 WETH, v4 ETH/USDG). Belum bisa LP.`);
+    await send(
+      timedOut
+        ? `⌛ RPC lambat — pool ${esc(meta.symbol)} belum kebaca semua. Paste ulang sebentar lagi (percobaan ke-2 lebih cepet — hasilnya di-cache).`
+        : `⚠️ Tidak ada pool ${esc(meta.symbol)} (v3 WETH, v4 ETH/USDG). Belum bisa LP.`,
+    );
     return;
   }
   // Keep pools with real activity: standing liq ≥ min OR 24h volume ≥ min. High-fee farming lives on
@@ -146,7 +165,14 @@ export async function onCA(addr: string): Promise<void> {
   // volume. If nothing passes, show the 3 most-active anyway (with a warning) so the user isn't stuck.
   const min = cfg.lp.minPoolTvlUsd;
   const active = (p: UPool) => Math.max(p.tvl, p.vol);
-  let pools = all.filter((p) => p.tvl >= min || p.vol >= min).sort((a, b) => b.fee - a.fee || b.vol - a.vol);
+  // v4 liq/vol read unreliably ($0) on Robinhood's singleton PoolManager, so DON'T hide v4 by the
+  // liq/vol floor — that dropped real pools ("tidak terdeteksi semua"). Show EVERY v4 pool; the dust
+  // filter applies only to v3 (reliable metrics). Busiest (most 24h vol) first, then highest fee.
+  const MAX_SHOW = 14;
+  let pools = all
+    .filter((p) => p.version === "v4" || p.tvl >= min || p.vol >= min)
+    .sort((a, b) => b.vol - a.vol || b.fee - a.fee)
+    .slice(0, MAX_SHOW);
   let note = "";
   if (!pools.length) {
     pools = [...all].sort((a, b) => active(b) - active(a)).slice(0, 3);
@@ -154,19 +180,38 @@ export async function onCA(addr: string): Promise<void> {
   }
   const dropped = all.length - pools.length;
   pending = { token: addr, meta, pools };
-  const rows = pools.map((p, i) => [
-    {
-      text: `${i + 1}. ${p.version.toUpperCase()} · fee ${(p.fee / 10000).toFixed(2)}% · ${p.liqLabel}`,
-      callback_data: `pool:${i}`,
-    },
-  ]);
-  const nV2 = pools.filter((p) => p.version === "v2").length;
-  const nV3 = pools.filter((p) => p.version === "v3").length;
-  const nV4 = pools.filter((p) => p.version === "v4").length;
-  const dropLine = dropped > 0 && !note ? `\n<i>(${dropped} pool dust — liq &amp; vol &lt; ${fmtUsdShort(min)} — disembunyiin)</i>` : "";
+  // ── airy 2-line blocks (a blank line between pools = breathing room; full pair names, no truncation).
+  //    HTML collapses leading spaces so the 💰 line sits flush-left, but the blank line keeps each pool
+  //    a clear visual block. APR hard-capped (micro-pools give absurd %). 🔥 = has real 24h volume. ──
+  const fmtFee = (f: number) => (f % 10000 === 0 ? `${f / 10000}%` : `${(f / 10000).toFixed(2)}%`);
+  const aprStr = (p: UPool): string => {
+    if (p.tvl <= 0 || p.vol <= 0) return "n/a";
+    const a = ((p.vol * (p.fee / 1e6) * 365) / p.tvl) * 100;
+    return a > 999 ? ">999%" : `${a.toFixed(0)}%`;
+  };
+  const realVol = cfg.scan.minVolUsd || 2000;
+  const body = pools
+    .map((p, i) => {
+      const hot = p.vol >= realVol ? "🔥 " : "";
+      const liq = p.tvl > 0 ? fmtUsdShort(p.tvl) : "n/a";
+      const vol = p.vol > 0 ? fmtUsdShort(p.vol) : "n/a";
+      return (
+        `${hot}<b>${i + 1}. ${esc(meta.symbol)}/${p.asset}</b> · ${p.version} · <b>${fmtFee(p.fee)}</b>\n` +
+        `💰 TVL ${liq}  ·  📊 24h ${vol}  ·  📈 APR ${aprStr(p)}`
+      );
+    })
+    .join("\n\n");
+  // number buttons (5/row) — pick by the list number
+  const numBtns: object[][] = [];
+  for (let i = 0; i < pools.length; i += 5) {
+    numBtns.push(pools.slice(i, i + 5).map((_, j) => ({ text: `${i + j + 1}`, callback_data: `pool:${i + j}` })));
+  }
+  const dropLine = dropped > 0 && !note ? ` · +${dropped} disembunyiin` : "";
   await send(
-    `Ketemu <b>${pools.length}</b> pool ${esc(meta.symbol)} (${nV2} v2 + ${nV3} v3 + ${nV4} v4) · liq/vol ≥ ${fmtUsdShort(min)}.${dropLine}${note}\nPilih:`,
-    { reply_markup: { inline_keyboard: rows } },
+    `🦄 <b>Pool ${esc(meta.symbol)}</b>  ·  ${pools.length} pool  ·  urut volume${dropLine}${note}\n\n` +
+      `${body}\n\n` +
+      `<i>🔥 = ada volume nyata (worth) · n/a = belum ke-index (sepi/baru).\nPilih nomer di bawah 👇</i>`,
+    { reply_markup: { inline_keyboard: numBtns } },
   );
 }
 
@@ -593,12 +638,10 @@ export async function onList(mid: number | null = null, force = false): Promise<
   }
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
   const { listV4Positions } = await import("../chain/v4/list.js");
-  const { listV2Positions } = await import("../chain/v2/list.js");
-  // v2 + v3 + v4 in parallel (was sequential → slow "Memuat posisi…")
-  const [rowsRes, v4rows, v2rows] = await Promise.all([
+  // v3 + v4 in parallel (v2 dropped — fee 0.30% only, not part of the high-fee farming strategy)
+  const [rowsRes, v4rows] = await Promise.all([
     listPositions().then((r) => ({ ok: true as const, r })).catch((e) => ({ ok: false as const, e })),
     listV4Positions().catch(() => []),
-    listV2Positions().catch(() => []),
   ]);
   if (!rowsRes.ok) {
     await out(`❌ ${short(rowsRes.e, 80)}`);
@@ -606,8 +649,8 @@ export async function onList(mid: number | null = null, force = false): Promise<
   }
   const rows = rowsRes.r;
   const refreshBtn = [{ text: "🔄 Refresh", callback_data: "refresh" }];
-  if (!rows.length && !v4rows.length && !v2rows.length) {
-    await out("Tidak ada posisi LP terbuka (v2/v3/v4).", { reply_markup: { inline_keyboard: [refreshBtn] } });
+  if (!rows.length && !v4rows.length) {
+    await out("Tidak ada posisi LP terbuka (v3/v4).", { reply_markup: { inline_keyboard: [refreshBtn] } });
     return;
   }
   const px = await ethUsd().catch(() => 0);
@@ -689,35 +732,11 @@ export async function onList(mid: number | null = null, force = false): Promise<
     }
   }
 
-  // ── v2 positions block ──
-  const T2: string[] = [];
-  if (v2rows.length) {
-    T2.push(`💧 UNISWAP v2 · ${v2rows.length} posisi · fee 0.30%`);
-    T2.push("─".repeat(37));
-    v2rows.forEach((r, i) => {
-      totEth += r.valueEth || 0;
-      if (r.depEth != null) totDep += r.depEth;
-      if (r.pnlEth != null) totPnl += r.pnlEth;
-      if (i) T2.push("");
-      T2.push(`${tokenEmoji(r.sym)} ${r.sym}/WETH  ·  ${r.sharePct.toFixed(3)}% pool`);
-      T2.push(`   ${padR("nilai", 7)} ${padL(r.valueEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.valueEth), 9)}`);
-      T2.push(`   ${padR("isi", 7)} ${r.amountToken} ${r.sym} + ${r.amountWeth} WETH`);
-      if (r.depEth != null) T2.push(`   ${padR("modal", 7)} ${padL(r.depEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(r.depEth), 9)}`);
-      if (r.pnlEth != null)
-        T2.push(`   ${padR("PnL", 7)} ${padL(sg(r.pnlEth, 6) + "Ξ", 11)}  ${padL((r.pnlEth >= 0 ? "+" : "-") + "$" + Math.abs(r.pnlEth * px).toFixed(2), 9)}  ${sg(r.pnlPct ?? 0, 1)}%`);
-      if (r.ageMs != null) T2.push(`   ${padR("umur", 7)} ${fmtAge(r.ageMs)}`);
-    });
-    for (const r of v2rows) {
-      const p = r.pnlEth != null ? ` ${r.pnlEth >= 0 ? "🟩" : "🟥"}${r.pnlEth >= 0 ? "+" : "-"}$${Math.abs(r.pnlEth * px).toFixed(2)}` : "";
-      btns.push([{ text: `Close ${r.sym}${p}`, callback_data: `v2c:${r.pair}` }]);
-    }
-  }
-
-  // ── unified TOTAL (v3 + v4 + v2), always LAST ──
-  const totalCount = rows.length + v4rows.length + v2rows.length;
+  // ── unified TOTAL (v3 + v4), always LAST ──
+  const totalCount = rows.length + v4rows.length;
   const S: string[] = [];
   if (totalCount > 1) {
-    S.push(`TOTAL ${totalCount} posisi  ·  v3 ${rows.length} · v4 ${v4rows.length} · v2 ${v2rows.length}`);
+    S.push(`TOTAL ${totalCount} posisi  ·  v3 ${rows.length} · v4 ${v4rows.length}`);
     S.push("─".repeat(37));
     S.push(`${padR("modal", 7)} ${padL(totDep.toFixed(6) + "Ξ", 11)}  ${padL(usd(totDep), 9)}`);
     S.push(`${padR("nilai", 7)} ${padL(totEth.toFixed(6) + "Ξ", 11)}  ${padL(usd(totEth), 9)}`);
@@ -730,7 +749,6 @@ export async function onList(mid: number | null = null, force = false): Promise<
   const body =
     (rows.length ? pre(T.join("\n")) : "") +
     (T4.length ? pre(T4.join("\n")) : "") +
-    (T2.length ? pre(T2.join("\n")) : "") +
     (S.length ? pre(S.join("\n")) : "");
   listCache = { head, body, btns, at: Date.now() };
   await out(head + "\n" + body, { reply_markup: { inline_keyboard: btns } });
@@ -1245,7 +1263,9 @@ export async function onAuto(arg = ""): Promise<void> {
     `── auto-close ──`,
     `${padR("take-profit", 13)} ${a.tpPct > 0 ? "+" + a.tpPct + "%" : "off"}`,
     `${padR("stop-loss", 13)} ${a.slPct > 0 ? "-" + a.slPct + "%" : "off"}`,
-    `${padR("close OOR", 13)} ${a.closeOor ? "on" : "off"}`,
+    `${padR("close OOR", 13)} ${a.closeOor ? "on" : "off"}${a.closeOor && a.oorAction === "rebalance" ? " → ♻️ rebalance" : ""}`,
+    `${padR("vol-fade", 13)} ${a.volFadeX > 0 ? `on (spike < ${a.volFadeX}×)` : "off"}`,
+    `${padR("compound", 13)} ${a.compound ? `on (fee ≥ $${a.compoundMinUsd})` : "off"}`,
     `${padR("cek tiap", 13)} ${a.manageSec}s`,
     ``,
     `${padR("hari ini", 13)} ${s.opensToday} open · ${s.spentToday.toFixed(4)}Ξ`,
@@ -1255,6 +1275,7 @@ export async function onAuto(arg = ""): Promise<void> {
       `<code>/auto on</code> · <code>/auto off</code>\n` +
       `Close: <code>/auto tp 100</code> · <code>/auto sl 50</code> · <code>/auto oor on|off</code>\n` +
       `Mode: <code>/set alpmode single</code> (rug-safe) · <code>/set alpmode inrange</code> (fee langsung)\n` +
+      `♻️ OOR→recenter: <code>/set alprebalance rebalance</code> · 🔁 compound fee: <code>/set alpcompound 1</code> · <code>/set alpcompoundmin 0.5</code>\n` +
       `Add: <code>/set alpsize 0.001</code> · <code>/set alpscore 75</code> · <code>/set alpmaxopen 3</code>\n` +
       `<i>⚠️ Tx otomatis pakai dana real. ${armed ? "Auto-close ARMED." : "Auto-close belum di-set."} Auto-add butuh radar (/set radar 1).</i>`,
   );
@@ -1686,7 +1707,12 @@ export async function onPnl(): Promise<void> {
   await send("📊 Menghitung PnL seumur hidup… (scan history + rug, ±20 detik)");
   let r;
   try {
-    r = await lifetimePnl();
+    // overall safety-net timeout so /pnl can't hang forever if Blockscout/RPC is slow (the per-token
+    // quote timeout in analytics.ts handles the usual culprit; this bounds the total scan).
+    r = await Promise.race([
+      lifetimePnl(),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("scan &gt; 45s — Blockscout/RPC lambat, coba lagi")), 45_000)),
+    ]);
   } catch (e) {
     await send(`❌ ${short(e, 90)}`);
     return;
@@ -1811,6 +1837,8 @@ const AUTOLP_NUM_MAP: Record<string, keyof typeof cfg.autoLp> = {
   alpgrace: "oorGraceMin",
   alpoorcount: "oorCooldownCount",
   alpoorhours: "oorCooldownHours",
+  alpcompoundmin: "compoundMinUsd", // min uncollected fees ($) before compounding
+  alpvolfade: "volFadeX", // #3 volume-fade exit: close when spikeX < this (0 = off)
 };
 const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
   huntvol: "minVolUsd",
@@ -1819,9 +1847,12 @@ const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
   huntscore: "minScore",
   huntmcapmin: "screenMinMcap", // mcap floor
   huntmcapmax: "screenMaxMcap", // mcap ceiling (0 = off) — farm SMALL-cap
+  huntpoolliq: "minPoolLiqUsd", // anti-wash: pool liquidity floor ($)
+  huntmaxratio: "maxVolLiqRatio", // anti-wash: max vol/liq ratio (0 = off)
+  huntspike: "minSpikeX", // #1 volume-spike: min recent-hour vs 24h-avg (0 = off)
 };
 const SET_HELP =
-  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours · alpmode single|inrange · alpclose 0/1";
+  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax, huntpoolliq, huntmaxratio, huntspike\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours, alpcompoundmin · alpmode single|inrange · alpclose 0/1 · alprebalance close|rebalance · alpcompound 0/1";
 
 export async function onSet(text: string): Promise<void> {
   const [, k, v] = text.split(/\s+/);
@@ -1846,6 +1877,30 @@ export async function onSet(text: string): Promise<void> {
     cfg.autoLp.closeOor = v === "1";
     persist();
     await send(`✓ autoLp.closeOor → ${v === "1" ? "on (tutup posisi OOR)" : "off (posisi dibiarin jalan)"}`);
+    return;
+  }
+  if (k === "alprebalance" || k === "alprebal") {
+    if (v !== "close" && v !== "rebalance") {
+      await send(
+        "Pilih: <code>/set alprebalance rebalance</code> (posisi OOR di-recenter ke harga baru) atau <code>/set alprebalance close</code> (default — tutup ke ETH).\n<i>butuh /set alpclose 1</i>",
+      );
+      return;
+    }
+    cfg.autoLp.oorAction = v;
+    persist();
+    await send(
+      `✓ autoLp.oorAction → <b>${v}</b> ${v === "rebalance" ? "(OOR → tutup + buka ulang recentered, modal terus kerja)" : "(OOR ditutup ke ETH)"}${v === "rebalance" && !cfg.autoLp.closeOor ? "\n⚠️ nyalain dulu: <code>/set alpclose 1</code>" : ""}`,
+    );
+    return;
+  }
+  if (k === "alpcompound") {
+    if (v !== "0" && v !== "1") {
+      await send("Toggle: <code>/set alpcompound 1</code> (fee di-compound balik) / <code>/set alpcompound 0</code> (off)");
+      return;
+    }
+    cfg.autoLp.compound = v === "1";
+    persist();
+    await send(`✓ autoLp.compound → ${v === "1" ? `on (fee ≥ $${cfg.autoLp.compoundMinUsd} di-harvest & di-add balik)` : "off"}`);
     return;
   }
   if (!k || v == null || isNaN(Number(v))) {

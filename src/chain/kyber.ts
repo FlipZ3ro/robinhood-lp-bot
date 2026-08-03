@@ -84,10 +84,24 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   const nativeIn = tokenIn.toLowerCase() === KYBER_NATIVE.toLowerCase();
   const slippageBps = Math.round((cfg.lp.slippagePct || 5) * 100);
 
-  const route = await kyberRoute(tokenIn, tokenOut, amountIn);
-  if (!route) return null;
-  const built = await kyberBuild(route.routeSummary, w.address, w.address, slippageBps);
-  if (!built) return null;
+  // route + build hit the KyberSwap aggregator over HTTP and TRANSIENTLY return "route not found"
+  // (indexing lag / momentary thin routing) even for a pair that routes fine seconds later — that was
+  // hard-failing LP opens with "gagal beli USDG via Kyber". Retry a few times (fast when it's a quick
+  // route-not-found response) before giving up so a flaky quote doesn't kill the open.
+  let route: RouteData | null = null;
+  let built: any = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    route = await kyberRoute(tokenIn, tokenOut, amountIn);
+    if (route) {
+      built = await kyberBuild(route.routeSummary, w.address, w.address, slippageBps);
+      if (built) {
+        if (attempt > 0) log.info(`kyber route ok setelah retry #${attempt}`);
+        break;
+      }
+    }
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 400 * (attempt + 1))); // 400ms · 800ms
+  }
+  if (!route || !built) return null;
 
   // ── security gates ──
   if (ethers.getAddress(built.routerAddress) !== ethers.getAddress(env.kyberRouter)) {

@@ -58,6 +58,15 @@ export const watchProvider = env.watchRpcUrl
   ? new ethers.JsonRpcProvider(env.watchRpcUrl, cfg.chainId)
   : provider;
 
+// Dedicated provider for v4 discovery getLogs (see rpcInitLogs). Full-range getLogs is the heaviest,
+// burstiest read the bot makes (hunt scans many tokens every 3m); giving it its OWN RPC keeps a burst
+// from slowing the main provider that mint/close depend on. Falls back to `provider` when unset.
+export const usingOwnLogsRpc = !!env.logsRpcUrl;
+export const logsProvider: ethers.JsonRpcProvider = env.logsRpcUrl
+  ? new ethers.JsonRpcProvider(env.logsRpcUrl, cfg.chainId)
+  : provider;
+if (usingOwnWatchRpc || usingOwnLogsRpc) log.info(`RPC split — watch:${usingOwnWatchRpc ? "own" : "main"} · logs:${usingOwnLogsRpc ? "own" : "main"}`);
+
 let _wallet: ethers.Wallet | null = null;
 export function wallet(): ethers.Wallet {
   if (!_wallet) {

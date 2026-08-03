@@ -101,6 +101,18 @@ const AutoLpSchema = z.object({
   oorGraceMin: z.number().default(30), // wait this long OOR before closing (single-side parks are OOR by design)
   oorCooldownCount: z.number().int().default(3), // #2 OOR cooldown: after this many OOR-closes, blacklist the token
   oorCooldownHours: z.number().default(12), // #2 OOR cooldown: ...for this long (stop re-entering a token that never fills)
+  // #1 rebalance-on-OOR: "close" = just close an OOR position (default). "rebalance" = close it THEN
+  // re-open the same token recentered on the current price (volatility-adaptive width) so the capital
+  // keeps earning instead of sitting idle in ETH. The OOR cooldown (above) caps the rebalance churn.
+  oorAction: z.enum(["close", "rebalance"]).default("close"),
+  // #3 fee-compound: harvest an in-range position's accrued fees and add them BACK as liquidity
+  // (compounding, no swap → no drag) once they clear compoundMinUsd. OFF by default.
+  compound: z.boolean().default(false),
+  compoundMinUsd: z.number().default(0.5), // only compound when uncollected fees ≥ this ($)
+  // #3 volume-FADE exit (Meteora "exit when volume fades"): close a position once its pool's current
+  // hour drops below this × the 24h-average hour (spikeX < volFadeX = the spike is over → rotate out).
+  // 0 = off. e.g. 0.35 = close when the current hour is under 35% of the pool's average hour.
+  volFadeX: z.number().default(0),
   manageSec: z.number().int().positive().default(90), // manage-loop interval (seconds)
 });
 
@@ -115,6 +127,14 @@ const ScanSchema = z.object({
   minVolUsd: z.number().default(10000), // pool 24h volume floor ("tx rame")
   minPoolFeesUsd: z.number().default(250), // #1 fee-yield: min 24h fees the pool generated (vol × fee%) — weights busy + HIGH-fee over raw volume
   minFeeYieldPct: z.number().default(0), // #1 fee-yield: min daily fee/TVL yield % — only enforced when TVL is readable (v4 singleton often reads $0 → skipped)
+  // ANTI-WASH: reject pools with huge volume on near-zero REAL liquidity (e.g. $130k vol on $0.5k liq
+  // = fake/wash volume + trap: your LP becomes ~all the liquidity). Only applied when liq is READABLE
+  // (>0) — v4 singleton liq frequently reads $0 which we can't assess, so those aren't blocked here.
+  minPoolLiqUsd: z.number().default(1000), // pool liquidity floor ($) — 0 = off
+  maxVolLiqRatio: z.number().default(0), // reject when vol/liq exceeds this (wash indicator) — 0 = off
+  // #1 volume-SPIKE (Meteora "volume is king"): require the pool's recent hour to be ≥ this × its
+  // 24h-average hour (spikeX = volH1/(vol24h/24)). >1 = heating up NOW. 0 = off (don't gate on spike).
+  minSpikeX: z.number().default(0),
   minScore: z.number().default(55), // screening score floor (0-100)
   cooldownMin: z.number().default(120), // don't re-alert the same token within this window
   // GMGN trending gates for the hunt — LOOSER than /screen (which targets big tokens), because
@@ -198,6 +218,9 @@ const DEFAULT_SEQUENCER = "https://sequencer.mainnet.chain.robinhood.com/";
 export const env = {
   rpcUrl: process.env.RH_RPC_URL?.trim() || cfg.rpcUrl,
   watchRpcUrl: process.env.RH_WATCH_RPC_URL?.trim() || "",
+  // dedicated RPC for the heavy v4 discovery getLogs (fromBlock=0 full-range) so a hunt-scan burst
+  // can't rate-limit / slow the main RPC that LP ops (mint/close) need. Falls back to `provider`.
+  logsRpcUrl: process.env.RH_LOGS_RPC_URL?.trim() || "",
   walletKey: (process.env.RH_WALLET_KEY || "").trim(),
   tgToken: (process.env.RH_TG_TOKEN || "").trim(),
   /** OWNER chat id — the auth boundary. Only this chat may command the bot. */

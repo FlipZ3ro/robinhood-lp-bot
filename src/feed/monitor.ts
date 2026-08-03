@@ -23,6 +23,7 @@ import { safetyCheck } from "../watch/scanner.js";
 import { bsFetch } from "../chain/blockscout.js";
 import { dataPath, readJson, writeJson } from "../util/files.js";
 import { logger } from "../util/log.js";
+import { nudge as nudgeManage } from "../radar/automanage.js";
 import { FeedListener } from "./listener.js";
 import { extractPoolEvents } from "./lpdecode.js";
 import { extractSwaps } from "./swapdecode.js";
@@ -65,7 +66,8 @@ export class FeedMonitor {
   private listener: FeedListener;
   private seen: Set<string>;
   private cooldown = new Map<string, number>(); // token → last new-token alert ts
-  private positions = new Map<string, PositionRow>(); // tokenLower → position
+  private positions = new Map<string, PositionRow>(); // tokenLower → position (v3, for the cheap slot0 OOR alert)
+  private posTokens = new Set<string>(); // ALL position token addrs (v3+v4), hex sans "0x" — feed→automanage nudge
   private inRangeState = new Map<string, boolean>(); // tokenId → was in range last check
   private activity = new Map<string, number>(); // tokenLower → swaps since last recheck
   private lastRangeCheck = new Map<string, number>(); // tokenLower → ts
@@ -84,7 +86,7 @@ export class FeedMonitor {
     this.posTimer = setInterval(() => void this.refreshPositions(), POS_REFRESH_MS);
     this.listener.start();
     log.info(
-      `ON — newToken=${cfg.feed.newToken} positionMonitor=${cfg.feed.positionMonitor} autoClose=${cfg.feed.autoCloseOutOfRange}`,
+      `ON — newToken=${cfg.feed.newToken} positionMonitor=${cfg.feed.positionMonitor} autoClose=${cfg.feed.autoCloseOutOfRange} · manage-nudge=${cfg.feed.positionMonitor ? "wired→automanage" : "off"}`,
     );
   }
 
@@ -111,6 +113,20 @@ export class FeedMonitor {
             this.stats.framesTx++;
             this.activity.set(k, (this.activity.get(k) ?? 0) + 1);
             if ((this.activity.get(k) ?? 0) >= cfg.feed.activityThreshold) void this.checkRange(k);
+          }
+        }
+      }
+      // feed → auto-manage nudge: ANY tx whose calldata references one of our position tokens (a swap
+      // on that pool via any router/version — broader than the v3-only extractSwaps above) triggers an
+      // immediate TP/SL/OOR check. Sub-second reaction vs the up-to-90s poll. nudge() self-debounces.
+      if (cfg.feed.positionMonitor && cfg.autoLp.enabled && this.posTokens.size) {
+        const data = (ftx.tx.data || "").toLowerCase();
+        if (data.length > 10) {
+          for (const tok of this.posTokens) {
+            if (data.includes(tok)) {
+              nudgeManage("feed-swap");
+              break;
+            }
           }
         }
       }
@@ -211,11 +227,22 @@ export class FeedMonitor {
     try {
       const rows = await listPositions();
       const next = new Map<string, PositionRow>();
+      const toks = new Set<string>();
       for (const r of rows) {
         next.set(r.tokenAddr.toLowerCase(), r);
         if (!this.inRangeState.has(r.tokenId)) this.inRangeState.set(r.tokenId, r.inRange);
+        toks.add(r.tokenAddr.toLowerCase().replace(/^0x/, ""));
       }
       this.positions = next;
+      // v4 positions can't be cheaply slot0-checked here (no simple pool addr), but a swap touching
+      // their token should still nudge automanage for the full TP/SL/OOR check — add their token addrs.
+      try {
+        const { listV4Positions } = await import("../chain/v4/list.js");
+        for (const r of await listV4Positions()) toks.add(r.tokenAddr.toLowerCase().replace(/^0x/, ""));
+      } catch {
+        /* v4 list optional */
+      }
+      this.posTokens = toks;
     } catch (e) {
       log.warn(`refresh positions gagal: ${(e as Error).message}`);
     }

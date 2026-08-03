@@ -6,7 +6,7 @@ import { startFeed, stopFeed } from "./feedLoop.js";
 import { startScan, stopScan } from "../radar/scanLoop.js";
 import { startManage, stopManage } from "../radar/automanage.js";
 import { handleHuntCandidate } from "./pipeline.js";
-import { notifyCandidate, notifyAutoClose } from "./notify.js";
+import { notifyCandidate, notifyAutoClose, notifyRebalance, notifyCompound } from "./notify.js";
 import { wallet } from "../chain/client.js";
 import { cfg } from "../config.js";
 import { logger } from "../util/log.js";
@@ -166,14 +166,21 @@ export async function run(): Promise<void> {
       void handleHuntCandidate(r, p).catch(() => {}); // auto-LP if /auto on + gate met
     },
   }); // hunter (cfg.scan.enabled)
-  startManage({ onAutoClose: (i) => void notifyAutoClose(i).catch(() => {}) }); // auto-close TP/SL/OOR (gated by cfg.autoLp)
+  startManage({
+    onAutoClose: (i) => void notifyAutoClose(i).catch(() => {}), // auto-close TP/SL/OOR (gated by cfg.autoLp)
+    onRebalance: (i) => void notifyRebalance(i).catch(() => {}), // #1 OOR → recentered re-open
+    onCompound: (i) => void notifyCompound(i).catch(() => {}), // #3 fees folded back in
+  });
   let offset = 0;
   while (running) {
     try {
       const r = await call("getUpdates", { offset, timeout: 25 });
       for (const u of r?.result ?? []) {
         offset = u.update_id + 1;
-        await handle(u).catch((e: Error) => log.error("handle err: " + e.message));
+        // NON-BLOCKING: don't await — a slow handler (e.g. /pnl lifetime scan, 20s+) must NOT block
+        // the loop, or every command tapped after it appears to "hang" until it finishes. Wallet txs
+        // stay serialized by txlock; read commands are safe to run concurrently.
+        void handle(u).catch((e: Error) => log.error("handle err: " + e.message));
       }
     } catch (e) {
       log.error("loop: " + String((e as Error).message).slice(0, 60));

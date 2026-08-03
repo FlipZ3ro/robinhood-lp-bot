@@ -45,6 +45,7 @@ export interface V4Row {
   ethPaired: boolean; // true if one side is native ETH (bot-manageable close)
   ageMs: number | null;
   tokenAddr: string; // the volatile (non-ETH/non-USDG) side — for OOR-cooldown keying
+  poolId: string; // v4 poolId — to match DexScreener volume for the #3 volume-fade check
 }
 
 const signed24 = (v: number): number => (v >= 0x800000 ? v - 0x1000000 : v);
@@ -96,21 +97,16 @@ export async function listClosedV4Positions(): Promise<V4ClosedRow[]> {
         pk.currency1.toLowerCase() === NATIVE ? Promise.resolve({ symbol: "ETH" }) : tokenMeta(pk.currency1).catch(() => ({ symbol: "?" })),
       ]);
       const dep = deps[tokenId];
-      // most-recent NFT transfer ≈ close time (best-effort, for sorting)
-      let closedAt: number | null = null;
-      try {
-        const tr = await bsFetch<{ items?: any[] }>(`/api/v2/tokens/${C.v4PositionManager}/instances/${tokenId}/transfers`, 8000);
-        const t0 = tr?.items?.[0]?.timestamp;
-        closedAt = t0 ? new Date(t0).getTime() : null;
-      } catch {
-        /* leave null */
-      }
+      // closedAt: use the bot's local deposit ts if we have it, else null. We DROPPED the per-NFT
+      // Blockscout `transfers` lookup — that was 1 rate-limited round-trip PER closed NFT (35+),
+      // which froze /ledger. Sorting falls back to tokenId order (higher = newer), good enough.
+      const depTs = (deps[tokenId] as { ts?: number } | undefined)?.ts ?? null;
       return {
         tokenId,
         pair: `${m0.symbol}/${m1.symbol}`,
         fee: Number(pk.fee),
         depEth: dep?.depositWei ? Number(ethers.formatEther(dep.depositWei)) : null,
-        closedAt,
+        closedAt: depTs,
       };
     } catch {
       return null;
@@ -169,11 +165,14 @@ export async function listV4Positions(): Promise<V4Row[]> {
   const posmL = C.v4PositionManager.toLowerCase();
   const deps = readJson<Record<string, { depositWei?: string; ts?: number; mintTs?: number }>>(dataPath("v4-positions.json"), {});
   let ids: string[] = [];
-  try {
-    const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
-    ids = (nft?.items ?? []).filter((i) => (i.token?.address_hash || "").toLowerCase() === posmL).map((i) => String(i.id));
-  } catch {
-    /* fall back to tracked ids */
+  const nft = await bsFetch<{ items?: any[] }>(`/api/v2/addresses/${w.address}/nft?type=ERC-721`);
+  if (nft?.items) {
+    ids = nft.items.filter((i) => (i.token?.address_hash || "").toLowerCase() === posmL).map((i) => String(i.id));
+  } else {
+    // Blockscout enum failed (rate-limit/lag). Positions opened OUTSIDE the bot (web UI) live ONLY in
+    // this enum, so they can transiently vanish from /list until Blockscout recovers. Bot-opened ones
+    // still show via the local deps union below. Surfaced so an empty /list isn't mistaken for "no pos".
+    log.warn("/list: enum NFT Blockscout kosong/gagal (rate-limit?) — andalin deps lokal (posisi web-UI bisa ke-skip sementara)");
   }
   ids = [...new Set([...ids, ...Object.keys(deps)])];
   // Drop tokenIds the ledger already knows are CLOSED — deps accumulates every historical mint
@@ -194,11 +193,26 @@ export async function listV4Positions(): Promise<V4Row[]> {
 
   const rows = await mapLimit(ids, 10, async (tokenId): Promise<V4Row | null> => {
     try {
-      const [owner, liquidity] = await Promise.all([
+      const [owner, liq0] = await Promise.all([
         retry(() => posm.ownerOf!(tokenId) as Promise<string>).catch(() => ethers.ZeroAddress),
         retry(() => posm.getPositionLiquidity!(tokenId) as Promise<bigint>).catch(() => 0n),
       ]);
-      if (owner.toLowerCase() !== w.address.toLowerCase() || liquidity === 0n) return null;
+      let liquidity = liq0;
+      // A just-opened position can momentarily read liquidity 0 if the RPC node lags the mint block —
+      // for RECENTLY-opened (local deposit ts < 15m) positions, re-read a few times before dropping so a
+      // fresh manual open reliably appears in /list instead of intermittently vanishing.
+      const freshTs = deps[tokenId]?.ts;
+      const isFresh = !!freshTs && Date.now() - freshTs < 15 * 60_000;
+      if (liquidity === 0n && isFresh) {
+        for (let i = 0; i < 3 && liquidity === 0n; i++) {
+          await new Promise((r) => setTimeout(r, 600));
+          liquidity = await (posm.getPositionLiquidity!(tokenId) as Promise<bigint>).catch(() => 0n);
+        }
+      }
+      if (owner.toLowerCase() !== w.address.toLowerCase() || liquidity === 0n) {
+        if (isFresh) log.info(`/list: skip fresh #${tokenId} (liq ${liquidity} owner ${owner.slice(0, 10)}) — baru dibuka tapi kosong/lag`);
+        return null;
+      }
 
       const [pk, infoRaw] = await retry(() => posm.getPoolAndPositionInfo!(tokenId));
       const info = BigInt(infoRaw);
@@ -296,6 +310,7 @@ export async function listV4Positions(): Promise<V4Row[]> {
         ethPaired,
         ageMs: openedAt ? Date.now() - openedAt : null,
         tokenAddr: ethers.getAddress(tokenAddr),
+        poolId,
       };
     } catch (e) {
       log.warn(`skip v4 #${tokenId}: ${(e as Error).message.slice(0, 80)}`);

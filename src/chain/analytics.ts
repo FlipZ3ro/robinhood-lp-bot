@@ -14,7 +14,7 @@ import { wallet, provider } from "./client.js";
 import { quoteTokenToWeth } from "./swaps.js";
 import { ethUsd } from "./price.js";
 import { listPositions } from "./positions.js";
-import { bsFetch } from "./blockscout.js";
+import { bsFetch, mapLimit } from "./blockscout.js";
 
 const INTERNAL = new Set(
   [C.positionManager, C.swapRouter02, C.factory, C.quoter, C.weth].map((a) => a.toLowerCase()),
@@ -107,23 +107,29 @@ export async function lifetimePnl(force = false): Promise<LifetimePnl> {
   let tokensEth = 0;
   let graveyardCount = 0;
   const graveyard: string[] = [];
-  // value all held tokens in PARALLEL (each quote hits 4 fee tiers; sequential = slow)
-  const valued = await Promise.all(
-    (tk?.items ?? []).map(async (it) => {
-      const t = it.token;
-      const dec = Number(t.decimals || 18);
-      const bal = Number(it.value) / 10 ** dec;
-      if (t.address_hash?.toLowerCase() === wethL) return { weth: bal, sellEth: 0, sym: "WETH", isWeth: true };
-      if (bal <= 0) return null;
-      let sellEth = 0;
-      try {
-        sellEth = (await quoteTokenToWeth(t.address_hash, BigInt(it.value))).weth;
-      } catch {
-        /* rug */
-      }
-      return { weth: 0, sellEth, sym: t.symbol || "?", isWeth: false };
-    }),
-  );
+  // Value held tokens with BOUNDED concurrency. The wallet accumulates dozens of dust tokens from
+  // churned positions (50+ here); quoting them ALL at once — each hits 4 fee tiers — fired ~200
+  // parallel RPC calls that saturated the RPC AND jammed the event loop, so even the per-quote
+  // timeout couldn't fire → /pnl hung ~indefinitely. mapLimit(8) keeps the burst small; the 5s
+  // per-quote timeout bounds each rug/honeypot (→ treated as unsellable).
+  const valued = await mapLimit(tk?.items ?? [], 8, async (it: any) => {
+    const t = it.token;
+    const dec = Number(t.decimals || 18);
+    const bal = Number(it.value) / 10 ** dec;
+    if (t.address_hash?.toLowerCase() === wethL) return { weth: bal, sellEth: 0, sym: "WETH", isWeth: true };
+    if (bal <= 0) return null;
+    let sellEth = 0;
+    try {
+      const q = await Promise.race([
+        quoteTokenToWeth(t.address_hash, BigInt(it.value)),
+        new Promise<{ weth: number }>((_, rej) => setTimeout(() => rej(new Error("quote timeout")), 5000)),
+      ]);
+      sellEth = q.weth;
+    } catch {
+      /* rug / honeypot / timeout → unsellable */
+    }
+    return { weth: 0, sellEth, sym: t.symbol || "?", isWeth: false };
+  });
   const graveSeen = new Set<string>();
   for (const r of valued) {
     if (!r) continue;

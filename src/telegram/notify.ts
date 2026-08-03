@@ -9,7 +9,7 @@ import type { SpikeHit } from "../types.js";
 import type { NewTokenAlert, OutOfRangeAlert } from "../feed/monitor.js";
 import type { ScreenResult } from "../radar/screen.js";
 import type { QualifiedPool } from "../chain/candidate.js";
-import type { AutoCloseInfo } from "../radar/automanage.js";
+import type { AutoCloseInfo, RebalanceInfo, CompoundInfo } from "../radar/automanage.js";
 
 /** Render an LLM/GMGN radar verdict as message lines (empty if no verdict). */
 function radarLines(v: Verdict | null): string[] {
@@ -160,8 +160,9 @@ export async function notifyAutoLp(r: AutoLpResult): Promise<void> {
 
 /** Auto-manage closed a position (take-profit / stop-loss / out-of-range). */
 export async function notifyAutoClose(i: AutoCloseInfo): Promise<void> {
-  const emo = i.reason === "TP" ? "🎯💰" : i.reason === "SL" ? "🛑" : "🚪";
-  const label = i.reason === "TP" ? "TAKE PROFIT" : i.reason === "SL" ? "STOP LOSS" : "OUT OF RANGE";
+  const emo = i.reason === "TP" ? "🎯💰" : i.reason === "SL" ? "🛑" : i.reason === "VFADE" ? "📉" : "🚪";
+  const label =
+    i.reason === "TP" ? "TAKE PROFIT" : i.reason === "SL" ? "STOP LOSS" : i.reason === "VFADE" ? "VOLUME FADE" : "OUT OF RANGE";
   const pnl =
     i.pnlPct != null
       ? `${i.pnlPct >= 0 ? "+" : ""}${i.pnlPct.toFixed(1)}%${i.pnlEth != null ? ` (${i.pnlEth >= 0 ? "+" : ""}${i.pnlEth.toFixed(6)}Ξ)` : ""}`
@@ -171,6 +172,28 @@ export async function notifyAutoClose(i: AutoCloseInfo): Promise<void> {
       `${emo} <b>AUTO-CLOSE · ${label}</b> · ${tokenEmoji(i.sym)} <b>${esc(i.sym)}</b> #${i.tokenId} [${i.version}]`,
       `PnL: <b>${pnl}</b>`,
       `<i>ditutup otomatis oleh auto-manage. Cek /list · /ledger</i>`,
+    ].join("\n"),
+  );
+}
+
+/** #1 An OOR position was closed AND re-opened recentered on the current price (rebalance). */
+export async function notifyRebalance(i: RebalanceInfo): Promise<void> {
+  await send(
+    [
+      `♻️ <b>REBALANCE</b> · ${tokenEmoji(i.sym)} <b>${esc(i.sym)}</b>`,
+      `posisi OOR #${i.oldTokenId} ditutup → dibuka ulang recentered #${i.newTokenId ?? "?"} di harga skarang.`,
+      `<i>modal balik in-range, lanjut makan fee. Cek /list</i>`,
+    ].join("\n"),
+  );
+}
+
+/** #3 A position's accrued fees were harvested and folded back in as liquidity (compound). */
+export async function notifyCompound(i: CompoundInfo): Promise<void> {
+  await send(
+    [
+      `🔁 <b>COMPOUND</b> · ${tokenEmoji(i.sym)} <b>${esc(i.sym)}</b> #${i.tokenId}`,
+      `fee ~$${i.feeUsd.toFixed(2)} di-harvest & di-add balik ke posisi (auto-compound).`,
+      `<i>Cek /list</i>`,
     ].join("\n"),
   );
 }

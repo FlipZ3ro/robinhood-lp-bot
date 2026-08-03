@@ -140,12 +140,16 @@ export async function maybeAutoLp(candidate: Candidate, verdict: Verdict | null)
     let result: OpenLike;
     if (q) {
       const m = await import("../chain/v4/mint.js");
-      log.info(`AUTO-OPEN ${candidate.symbol} ${a.sizeEth}Ξ ${modeLabel} v4 ${q.quote} fee ${q.fee}`);
+      // volatility-adaptive range width (calculate_new_range(price, volatility) idea): wider when the
+      // token moved a lot (stays in range → earns fees → hits TP), narrow when calm (concentrated
+      // fees). q.volPct = |1h/6h price change|. Only for in-range (single-side parks don't need it).
+      const width = Math.max(6, Math.min(24, Math.round(8 + q.volPct / 5)));
+      log.info(`AUTO-OPEN ${candidate.symbol} ${a.sizeEth}Ξ ${modeLabel} v4 ${q.quote} fee ${q.fee}${inRange ? ` · vol ${q.volPct.toFixed(0)}% → width ${width}sp` : ""}`);
       if (q.quote === "usd") {
-        result = inRange ? await m.openV4UsdgInRange(q.v4, String(a.sizeEth)) : await m.openV4UsdgSingleSide(q.v4, String(a.sizeEth));
+        result = inRange ? await m.openV4UsdgInRange(q.v4, String(a.sizeEth), { widthSpacings: width }) : await m.openV4UsdgSingleSide(q.v4, String(a.sizeEth));
       } else {
         result = inRange
-          ? await m.openV4InRange(candidate.token, String(a.sizeEth), { fee: q.fee })
+          ? await m.openV4InRange(candidate.token, String(a.sizeEth), { fee: q.fee, widthSpacings: width })
           : await m.openV4SingleSide(candidate.token, String(a.sizeEth), { fee: q.fee });
       }
     } else {
@@ -163,6 +167,41 @@ export async function maybeAutoLp(candidate: Candidate, verdict: Verdict | null)
   } finally {
     releaseWallet();
   }
+}
+
+/**
+ * #1 rebalance: re-open a v4 position on `token`, recentered on the CURRENT price, after an OOR close.
+ * Respects the configured mode (inrange/single) + volatility-adaptive width. Returns null (→ stay
+ * closed) if the token no longer qualifies (pool dried / rug) or the wallet is short on funds. Records
+ * the open in state so autolp's per-token dedup + rate caps account for it too. Caller holds the wallet
+ * lock (rebalance runs inside doClose, right after the close, so the sequence is atomic on the wallet).
+ */
+export async function reopenRecentered(token: string, symbol: string): Promise<OpenLike | null> {
+  const a = cfg.autoLp;
+  const { qualifyCandidate } = await import("../chain/candidate.js");
+  const q = await qualifyCandidate(token).catch(() => null);
+  if (!q) return null; // no farmable 3-5% pool anymore → don't redeploy into a dead token
+  const b = await balances().catch(() => null);
+  if (b) {
+    const usable = Number(b.weth) + Math.max(0, Number(b.eth) - GAS_RESERVE);
+    if (usable < a.sizeEth) return null; // close proceeds not enough to re-open at size
+  }
+  const inRange = a.mode === "inrange";
+  const m = await import("../chain/v4/mint.js");
+  const width = Math.max(6, Math.min(24, Math.round(8 + q.volPct / 5)));
+  log.info(
+    `REBALANCE ${symbol} ${a.sizeEth}Ξ ${inRange ? "in-range" : "single-side"} v4 ${q.quote} fee ${q.fee}${inRange ? ` · vol ${q.volPct.toFixed(0)}% → width ${width}sp` : ""}`,
+  );
+  let result: OpenLike;
+  if (q.quote === "usd") {
+    result = inRange ? await m.openV4UsdgInRange(q.v4, String(a.sizeEth), { widthSpacings: width }) : await m.openV4UsdgSingleSide(q.v4, String(a.sizeEth));
+  } else {
+    result = inRange ? await m.openV4InRange(token, String(a.sizeEth), { fee: q.fee, widthSpacings: width }) : await m.openV4SingleSide(token, String(a.sizeEth), { fee: q.fee });
+  }
+  const st = load();
+  st.opens.push({ ts: Date.now(), token, sizeEth: a.sizeEth, tokenId: result.tokenId });
+  save(st);
+  return result;
 }
 
 /** Snapshot for /auto status. */

@@ -405,7 +405,7 @@ export function balancedEthForHeldToken(token: string, meta: { decimals: number;
 }
 
 /** Approve an ERC20 for the v4 PositionManager via Permit2 (ERC20→Permit2, Permit2→POSM). */
-async function approveViaPermit2(tokenAddr: string): Promise<void> {
+export async function approveViaPermit2(tokenAddr: string): Promise<void> {
   const w = wallet();
   const erc = new ethers.Contract(tokenAddr, ["function allowance(address,address) view returns (uint256)", "function approve(address,uint256) returns (bool)"], w);
   if ((await erc.allowance!(w.address, PERMIT2)) < (1n << 200n)) {
@@ -424,7 +424,7 @@ async function approveViaPermit2(tokenAddr: string): Promise<void> {
 export async function openV4UsdgInRange(
   pool: V4Pool,
   amountEthStr: string,
-  opts?: { increaseTokenId?: string; range?: { tickLower: number; tickUpper: number } },
+  opts?: { increaseTokenId?: string; range?: { tickLower: number; tickUpper: number }; widthSpacings?: number },
 ): Promise<V4OpenResult & { swapHash?: string; swappedPct: number }> {
   const w = wallet();
   const total = ethers.parseEther(amountEthStr);
@@ -439,7 +439,9 @@ export async function openV4UsdgInRange(
   // Split the ETH budget by the value fraction at the DISCOVERY tick — just to decide how much of
   // each side to buy. The position itself is built from FRESH state below.
   const sp = pool.tickSpacing;
-  const half = Math.max(1, Math.round(8 / 2));
+  // range half-width in tick-spacings — volatility-adaptive when the caller passes widthSpacings
+  // (wider for volatile tokens → stays in range longer → earns fees → hits TP instead of churning OOR).
+  const half = Math.max(1, Math.round((opts?.widthSpacings ?? 8) / 2));
   const anchor0 = Math.floor(pool.tick / sp) * sp;
   const fracC1 = Math.min(0.95, Math.max(0.05, swapFractionV4(pool.tick, anchor0 - half * sp, anchor0 + half * sp)));
   const ethForC1 = (total * BigInt(Math.round(fracC1 * 1e6))) / 1_000_000n;

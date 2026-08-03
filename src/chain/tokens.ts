@@ -12,6 +12,12 @@ import type { TokenMeta } from "../types.js";
 const metaCache = new Map<string, TokenMeta>();
 const sdkCache = new Map<string, TokenT>();
 
+// A .catch() only handles a REJECTION — not a HANG. A rug / giant-name / gas-bomb token's view call
+// (or a momentarily stuck RPC) can leave symbol()/decimals() pending forever, which froze /list,
+// /ledger and /pnl (all call tokenMeta per position). Bound each read: on timeout, use the fallback.
+const capRead = <T>(p: Promise<T>, fb: T, ms = 5000): Promise<T> =>
+  Promise.race([p.catch(() => fb), new Promise<T>((r) => setTimeout(() => r(fb), ms))]);
+
 export async function tokenMeta(addr: string): Promise<TokenMeta> {
   const a = ethers.getAddress(addr);
   const hit = metaCache.get(a);
@@ -19,9 +25,9 @@ export async function tokenMeta(addr: string): Promise<TokenMeta> {
 
   const c = new ethers.Contract(a, ERC20_ABI, provider);
   const [symbol, decimals, supply] = await Promise.all([
-    c.symbol!().catch(() => "?"),
-    c.decimals!().catch(() => 18),
-    c.totalSupply!().catch(() => 0n),
+    capRead<string>(c.symbol!() as Promise<string>, "?"),
+    capRead<number | bigint>(c.decimals!() as Promise<number | bigint>, 18),
+    capRead<bigint>(c.totalSupply!() as Promise<bigint>, 0n),
   ]);
   const dec = Number(decimals);
   const m: TokenMeta = {

@@ -11,7 +11,7 @@ import { wallet, provider, overrides } from "../client.js";
 import { tokenMeta } from "../tokens.js";
 import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { NATIVE } from "./poolkey.js";
-import { loadV4Deposit } from "./mint.js";
+import { loadV4Deposit, approveViaPermit2 } from "./mint.js";
 import { listV4Positions } from "./list.js";
 import { ethUsd } from "../price.js";
 import { kyberSwap, KYBER_NATIVE } from "../kyber.js";
@@ -19,8 +19,8 @@ import { appendLedger } from "../ledger.js";
 import { dataPath, readJson, writeJson } from "../../util/files.js";
 import { logger } from "../../util/log.js";
 
-const { Ether, Token, CurrencyAmount } = sdkCore as any;
-const { Pool, Position } = v4sdk as any;
+const { Ether, Token, CurrencyAmount, Percent } = sdkCore as any;
+const { Pool, Position, V4PositionManager } = v4sdk as any;
 const log = logger("v4close");
 const STABLES = new Set(["0x5fc5360d0400a0fd4f2af552add042d716f1d168"]); // USDG
 const WETH_L = C.weth.toLowerCase();
@@ -310,6 +310,75 @@ export async function collectV4Fees(tokenId: string): Promise<V4CollectResult> {
   const [a0, a1] = await Promise.all([balOf(c0, m0.decimals), balOf(c1, m1.decimals)]);
   log.info(`collect v4 #${tokenId} ${m0.symbol}/${m1.symbol}`);
   return { txHash, fee0: Math.max(0, a0 - b0), sym0: m0.symbol, fee1: Math.max(0, a1 - b1), sym1: m1.symbol };
+}
+
+export interface V4CompoundResult {
+  compounded: boolean;
+  reason?: string;
+  txHash?: string;
+  add0?: number;
+  sym0?: string;
+  add1?: number;
+  sym1?: string;
+}
+
+/**
+ * #3 fee-compound: harvest an in-range position's accrued fees and add them straight back as
+ * liquidity (no swap → no fee drag). Collects fees to the wallet, measures EXACTLY what was
+ * collected (raw balance delta, so any pre-held USDG parked in the wallet is NEVER redeposited),
+ * then increases the same tokenId with those amounts. The ratio-mismatch remainder stays as dust
+ * (tiny; swept on the eventual close). USDG/ERC20 pairs only — a native-ETH leg needs a useNative
+ * settle path, so ETH pairs are skipped (returns compounded:false with a reason).
+ *
+ * Deposit basis is intentionally UNCHANGED: the fees were already earned profit, so folding them
+ * into liquidity doesn't raise the cost basis — they surface as PnL when the position finally closes.
+ */
+export async function compoundV4Position(tokenId: string): Promise<V4CompoundResult> {
+  const { pool, c0, c1, m0, m1, tickLower, tickUpper } = await loadPosition(tokenId);
+  if (c0.toLowerCase() === NATIVE || c1.toLowerCase() === NATIVE) {
+    return { compounded: false, reason: "pair ETH (compound cuma pair USDG/ERC20)" };
+  }
+
+  // 1) harvest — RAW deltas so pre-held balances (e.g. parked USDG) are never folded in
+  const [before0, before1] = await Promise.all([rawBalOf(c0), rawBalOf(c1)]);
+  await collectV4Fees(tokenId);
+  const [after0, after1] = await Promise.all([rawBalOf(c0), rawBalOf(c1)]);
+  const fee0 = after0 > before0 ? after0 - before0 : 0n;
+  const fee1 = after1 > before1 ? after1 - before1 : 0n;
+  if (fee0 <= 0n && fee1 <= 0n) return { compounded: false, reason: "gak ada fee kekumpul" };
+
+  // 2) build an INCREASE from EXACTLY the collected fees; scale to what we hold so the slippage-max
+  //    settle can't overpull (same guard the open path uses). Binding side sets liquidity.
+  const slip = new Percent(5, 100);
+  const mk = (a0: bigint, a1: bigint) =>
+    Position.fromAmounts({ pool, tickLower, tickUpper, amount0: a0.toString(), amount1: a1.toString(), useFullPrecision: true });
+  let position = mk(fee0, fee1);
+  try {
+    const mx = position.mintAmountsWithSlippage(slip);
+    const m0max = BigInt(mx.amount0.toString());
+    const m1max = BigInt(mx.amount1.toString());
+    let numer = 1_000_000n;
+    if (m0max > fee0 && m0max > 0n) { const r = (fee0 * 1_000_000n) / m0max; if (r < numer) numer = r; }
+    if (m1max > fee1 && m1max > 0n) { const r = (fee1 * 1_000_000n) / m1max; if (r < numer) numer = r; }
+    if (numer < 1_000_000n) { const s = (x: bigint) => (((x * numer) / 1_000_000n) * 999n) / 1000n; position = mk(s(fee0), s(fee1)); }
+  } catch {
+    /* SDK lacks mintAmountsWithSlippage */
+  }
+  if (position.liquidity.toString() === "0") return { compounded: false, reason: "fee kekecilan/gak seimbang buat nambah liq" };
+
+  // 3) approve both ERC20 via Permit2, then INCREASE_LIQUIDITY on the existing tokenId
+  await approveViaPermit2(c0);
+  await approveViaPermit2(c1);
+  const { calldata, value } = V4PositionManager.addCallParameters(position, {
+    tokenId,
+    slippageTolerance: slip,
+    deadline: Math.floor(Date.now() / 1000 + 600).toString(),
+  });
+  const txHash = await simulateAndSend(calldata, value ?? "0", "compound");
+  const add0 = Number(ethers.formatUnits(BigInt(position.amount0.quotient.toString()), m0.decimals));
+  const add1 = Number(ethers.formatUnits(BigInt(position.amount1.quotient.toString()), m1.decimals));
+  log.info(`compound v4 #${tokenId} ${m0.symbol}/${m1.symbol}: +${add0} ${m0.symbol} +${add1} ${m1.symbol}`);
+  return { compounded: true, txHash, add0, sym0: m0.symbol, add1, sym1: m1.symbol };
 }
 
 async function balOf(addr: string, dec: number): Promise<number> {

@@ -89,15 +89,34 @@ async function runScan(): Promise<{ found: number; scanned: number }> {
     const pool = await qualifyCandidate(r.token.address).catch(() => null);
     return pool ? { r, pool } : null;
   });
+  // Tokens we ALREADY hold a position in — don't re-alert / risk a duplicate add (the operator asked:
+  // "kalau udah ada posisi di token-nya, skip"). maybeAutoLp already dedupes the auto-add, but this also
+  // silences the noisy repeat ALERT (and the manual "LP <token>" tap that would open a 2nd position).
+  const held = new Set<string>();
+  try {
+    const [{ listPositions }, { listV4Positions }] = await Promise.all([import("../chain/positions.js"), import("../chain/v4/list.js")]);
+    const [v3, v4] = await Promise.all([listPositions().catch(() => []), listV4Positions().catch(() => [])]);
+    for (const r of v3) {
+      const a = (r as { tokenAddr?: string }).tokenAddr;
+      if (a) held.add(a.toLowerCase());
+    }
+    for (const r of v4) held.add(r.tokenAddr.toLowerCase());
+  } catch {
+    /* best-effort — if holdings can't be read, don't block alerts */
+  }
   let found = 0;
   for (const q of qualified) {
     if (!q) continue;
+    if (held.has(q.r.token.address.toLowerCase())) {
+      log.info(`skip kandidat ${q.r.token.symbol} — udah ada posisi di token itu`);
+      continue;
+    }
     alerted.set(q.r.token.address.toLowerCase(), now);
     found++;
     stats.alerts++;
     const mc = q.r.token.marketCap ?? 0;
     log.info(
-      `kandidat ${q.r.token.symbol} · mcap $${(mc / 1e3).toFixed(0)}k · pool ${(q.pool.fee / 10000).toFixed(2)}% vol $${(q.pool.volUsd / 1e3).toFixed(1)}k fees $${q.pool.feesUsd.toFixed(0)} · skor ${q.r.score}`,
+      `kandidat ${q.r.token.symbol} · mcap $${(mc / 1e3).toFixed(0)}k · pool ${(q.pool.fee / 10000).toFixed(2)}% vol $${(q.pool.volUsd / 1e3).toFixed(1)}k fees $${q.pool.feesUsd.toFixed(0)} · spike ${q.pool.spikeX.toFixed(1)}x · skor ${q.r.score}`,
     );
     hooks?.onCandidate(q.r, q.pool);
   }
