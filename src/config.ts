@@ -234,6 +234,13 @@ export const env = {
   openrouterKey: (process.env.RH_OPENROUTER_KEY || "").trim(),
   openrouterUrl: process.env.RH_OPENROUTER_URL?.trim() || "https://openrouter.ai/api/v1/chat/completions",
   openrouterModel: process.env.RH_OPENROUTER_MODEL?.trim() || "nvidia/nemotron-3-super-120b-a12b:free",
+  // Daily-briefing LLM (a smarter model for the once-a-day analysis). Falls back to the same gateway
+  // + key the screener already uses (RH_OPENROUTER_*, both SECRET / private-gateway URL → .env only)
+  // so neither the key nor the gateway host is ever committed; only the MODEL differs
+  // (cc/claude-sonnet-5). Override per-var via RH_BRIEF_* to point the briefing at a different gateway.
+  briefUrl: process.env.RH_BRIEF_URL?.trim() || process.env.RH_OPENROUTER_URL?.trim() || "https://openrouter.ai/api/v1/chat/completions",
+  briefKey: (process.env.RH_BRIEF_KEY || process.env.RH_OPENROUTER_KEY || "").trim(),
+  briefModel: process.env.RH_BRIEF_MODEL?.trim() || "cc/claude-sonnet-5",
   gmgnKey: (process.env.RH_GMGN_KEY || "").trim(),
   // KyberSwap aggregator — best-route swaps (auto multi-hop across all pools/fee-tiers/hooks).
   // Used to acquire the token side before an in-range LP (far better execution than swapping on

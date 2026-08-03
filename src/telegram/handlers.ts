@@ -639,10 +639,16 @@ export async function onList(mid: number | null = null, force = false): Promise<
   const out = (txt: string, extra?: Record<string, unknown>) => (mid ? edit(mid, txt, extra) : send(txt, extra));
   const { listV4Positions } = await import("../chain/v4/list.js");
   // v3 + v4 in parallel (v2 dropped — fee 0.30% only, not part of the high-fee farming strategy)
+  // v4 served from the ≤90s background snapshot (manage loop keeps it warm) so /list prints instantly
+  // instead of racing the RPC against the hunt scan. 🔄 Refresh (force) recomputes fresh.
+  const _t0 = Date.now();
+  const [v3t, v4t] = [{ ms: 0 }, { ms: 0 }];
   const [rowsRes, v4rows] = await Promise.all([
-    listPositions().then((r) => ({ ok: true as const, r })).catch((e) => ({ ok: false as const, e })),
-    listV4Positions().catch(() => []),
+    (async () => { const s = Date.now(); const r = await listPositions().then((r) => ({ ok: true as const, r })).catch((e) => ({ ok: false as const, e })); v3t.ms = Date.now() - s; return r; })(),
+    (async () => { const s = Date.now(); const r = await listV4Positions(force ? 0 : 90_000).catch(() => [] as Awaited<ReturnType<typeof listV4Positions>>); v4t.ms = Date.now() - s; return r; })(),
   ]);
+  const _px0 = Date.now();
+  log.info(`/list timing: v3 ${v3t.ms}ms · v4 ${v4t.ms}ms (${v4rows.length}pos, force=${force}) · data-total ${_px0 - _t0}ms`);
   if (!rowsRes.ok) {
     await out(`❌ ${short(rowsRes.e, 80)}`);
     return;
@@ -1703,6 +1709,12 @@ async function sendCloseCard(p: {
   }
 }
 
+export async function onBriefing(): Promise<void> {
+  await send("📋 Nyusun briefing harian… (analisa LLM bisa ~1 menit)");
+  const { runBriefing } = await import("./briefing.js");
+  await runBriefing("manual");
+}
+
 export async function onPnl(): Promise<void> {
   await send("📊 Menghitung PnL seumur hidup… (scan history + rug, ±20 detik)");
   let r;
@@ -1850,9 +1862,10 @@ const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
   huntpoolliq: "minPoolLiqUsd", // anti-wash: pool liquidity floor ($)
   huntmaxratio: "maxVolLiqRatio", // anti-wash: max vol/liq ratio (0 = off)
   huntspike: "minSpikeX", // #1 volume-spike: min recent-hour vs 24h-avg (0 = off)
+  huntcooldown: "cooldownMin", // menit sebelum token yg udah di-alert boleh muncul lagi (rotasi cepet = kecil)
 };
 const SET_HELP =
-  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax, huntpoolliq, huntmaxratio, huntspike\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours, alpcompoundmin · alpmode single|inrange · alpclose 0/1 · alprebalance close|rebalance · alpcompound 0/1";
+  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax, huntpoolliq, huntmaxratio, huntspike, huntcooldown\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours, alpcompoundmin · alpmode single|inrange · alpclose 0/1 · alprebalance close|rebalance · alpcompound 0/1";
 
 export async function onSet(text: string): Promise<void> {
   const [, k, v] = text.split(/\s+/);

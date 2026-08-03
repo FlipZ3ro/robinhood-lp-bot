@@ -49,7 +49,10 @@ const oorSince = new Map<string, number>(); // tokenId → first-seen-OOR ts (gr
 const stats = { runs: 0, closed: 0, rebalanced: 0, compounded: 0, nudges: 0, lastAt: 0 };
 let tickRunning = false; // a manage tick is in-flight (timer + feed nudge must not overlap)
 let lastTickAt = 0; // ts of the last tick START (debounce feed nudges)
-const NUDGE_MIN_MS = 4000; // a burst of feed events runs the check at most ~once / 4s
+// A busy-pool position gets HAMMERED with swaps (SESTRI/GME $60k vol) → the feed nudged the manage
+// loop every ~4s, running listV4Positions non-stop → RPC + Blockscout got rate-limited and /list hung.
+// 30s still reacts ~3× faster than the 90s poll but stops the hammering. Tune via RH_NUDGE_MS.
+const NUDGE_MIN_MS = Number(process.env.RH_NUDGE_MS) || 30_000;
 
 /** Any manage action armed? (loop is a no-op otherwise, even when /auto is ON.) */
 function armed(): boolean {
@@ -202,7 +205,7 @@ async function doClose(it: Item, reason: CloseReason): Promise<void> {
       await closePosition(it.tokenId);
     } else {
       const { closeV4Position } = await import("../chain/v4/close.js");
-      await closeV4Position(it.tokenId);
+      await closeV4Position(it.tokenId, reason);
     }
     stats.closed++;
     if (reason === "OOR") recordOor(it.tokenAddr); // #2: streak toward blacklisting a token that never fills

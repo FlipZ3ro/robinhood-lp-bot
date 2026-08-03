@@ -5,6 +5,7 @@ import { startWatch } from "./watchLoop.js";
 import { startFeed, stopFeed } from "./feedLoop.js";
 import { startScan, stopScan } from "../radar/scanLoop.js";
 import { startManage, stopManage } from "../radar/automanage.js";
+import { startBriefingScheduler } from "./briefing.js";
 import { handleHuntCandidate } from "./pipeline.js";
 import { notifyCandidate, notifyAutoClose, notifyRebalance, notifyCompound } from "./notify.js";
 import { wallet } from "../chain/client.js";
@@ -103,6 +104,7 @@ async function routeMessage(m: any): Promise<void> {
   if (t.startsWith("/v4")) return H.onV4(t.split(/\s+/)[1]);
   if (t.startsWith("/v2close")) return H.onV2Close(t.split(/\s+/)[1] ?? "");
   if (t === "/pnl") return H.onPnl();
+  if (t === "/briefing" || t === "/brief") return H.onBriefing();
   if (t === "/sell") return H.onSell();
   if (t === "/closeall") return H.onCloseAll();
   if (t === "/wallet") return H.onWallet();
@@ -129,6 +131,7 @@ async function registerCommands(): Promise<void> {
       { command: "list", description: "📋 Posisi LP terbuka (v3+v4) + close" },
       { command: "ledger", description: "📒 Riwayat posisi ditutup (realized PnL)" },
       { command: "pnl", description: "💰 PnL seumur hidup" },
+      { command: "briefing", description: "📋 Briefing harian (analisa posisi + saran)" },
       { command: "feed", description: "📡 Monitor sequencer real-time" },
       { command: "watch", description: "👁 Pemantau lonjakan volume" },
       { command: "scan", description: "🔍 Cek lonjakan volume sekarang" },
@@ -171,6 +174,7 @@ export async function run(): Promise<void> {
     onRebalance: (i) => void notifyRebalance(i).catch(() => {}), // #1 OOR → recentered re-open
     onCompound: (i) => void notifyCompound(i).catch(() => {}), // #3 fees folded back in
   });
+  startBriefingScheduler(); // 📋 daily briefing at 07:00 WIB (deterministic + LLM analysis)
   let offset = 0;
   while (running) {
     try {

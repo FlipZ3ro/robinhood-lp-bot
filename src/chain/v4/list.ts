@@ -159,8 +159,14 @@ function usdOfCurrency(addr: string, sym: string, px: number): number | null {
   return null;
 }
 
-export async function listV4Positions(): Promise<V4Row[]> {
+// Last computed position snapshot. /list serves this instantly (staleOkMs) instead of racing the RPC
+// against the hunt scanner — the manage loop + autolp + hunt already refresh it every 90s-3m, so it's
+// always warm. Callers that need FRESH state (manage TP/SL/OOR, autolp gate) pass staleOkMs=0 (default).
+let posCache: { rows: V4Row[]; at: number } | null = null;
+
+export async function listV4Positions(staleOkMs = 0): Promise<V4Row[]> {
   if (!C.v4PositionManager || !C.v4StateView) return [];
+  if (staleOkMs > 0 && posCache && Date.now() - posCache.at < staleOkMs) return posCache.rows;
   const w = wallet();
   const posmL = C.v4PositionManager.toLowerCase();
   const deps = readJson<Record<string, { depositWei?: string; ts?: number; mintTs?: number }>>(dataPath("v4-positions.json"), {});
@@ -191,7 +197,31 @@ export async function listV4Positions(): Promise<V4Row[]> {
   const coder = ethers.AbiCoder.defaultAbiCoder();
   const px = await ethUsd().catch(() => 0);
 
-  const rows = await mapLimit(ids, 10, async (tokenId): Promise<V4Row | null> => {
+  // Pre-filter via Multicall3: read getPositionLiquidity for ALL ids in ONE eth_call and drop the
+  // CLOSED (0-liq) NFTs the wallet accumulates (30+). Otherwise /list pays 2 reads PER dead NFT — that
+  // is what made "Memuat posisi" crawl. Only the surviving OPEN ids get the full per-position read below.
+  let openIds = ids;
+  try {
+    const mc = new ethers.Contract("0xcA11bde05977b3631167028862bE2a173976CA11", ["function aggregate3((address,bool,bytes)[]) view returns ((bool,bytes)[])"], provider);
+    const calls = ids.map((id) => ({ target: C.v4PositionManager, allowFailure: true, callData: posm.interface.encodeFunctionData("getPositionLiquidity", [id]) }));
+    const res: Array<{ success: boolean; returnData: string }> = await mc.aggregate3!(calls);
+    openIds = ids.filter((id, i) => {
+      const r = res[i];
+      if (!r?.success) return true; // couldn't read → keep, let the full read decide
+      try {
+        const liq = BigInt(posm.interface.decodeFunctionResult("getPositionLiquidity", r.returnData)[0]);
+        const fresh = !!deps[id]?.ts && Date.now() - deps[id]!.ts! < 15 * 60_000;
+        return liq > 0n || fresh; // keep open, or freshly-opened (liq may lag the mint block)
+      } catch {
+        return true;
+      }
+    });
+  } catch {
+    /* multicall unavailable → fall through with all ids (the per-position read still filters 0-liq) */
+  }
+  if (!openIds.length) return [];
+
+  const rows = await mapLimit(openIds, 10, async (tokenId): Promise<V4Row | null> => {
     try {
       const [owner, liq0] = await Promise.all([
         retry(() => posm.ownerOf!(tokenId) as Promise<string>).catch(() => ethers.ZeroAddress),
@@ -317,5 +347,7 @@ export async function listV4Positions(): Promise<V4Row[]> {
       return null;
     }
   });
-  return rows.filter((r): r is V4Row => r !== null);
+  const out = rows.filter((r): r is V4Row => r !== null);
+  posCache = { rows: out, at: Date.now() };
+  return out;
 }

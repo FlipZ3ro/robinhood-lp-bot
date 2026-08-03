@@ -89,7 +89,7 @@ export interface V4CloseResult {
   sweptEth?: number; // ETH gained from sweeping token/USDG proceeds back to native
 }
 
-export async function closeV4Position(tokenId: string): Promise<V4CloseResult> {
+export async function closeV4Position(tokenId: string, reason?: "TP" | "SL" | "OOR" | "VFADE" | "manual"): Promise<V4CloseResult> {
   const w = wallet();
   // Read the pool key + currencies directly (no SDK Pool). The SDK's removeCallParameters
   // throws "Invariant failed: PRICE_BOUNDS" on extreme-price pools (WOLVES/USDG) when it
@@ -229,6 +229,7 @@ export async function closeV4Position(tokenId: string): Promise<V4CloseResult> {
       tokenRug: 0,
       unsoldEth: 0,
       source: "bot",
+      reason: reason ?? "manual",
     });
   } catch (e) {
     log.warn(`gagal tulis ledger v4 #${tokenId}: ${(e as Error).message.slice(0, 80)}`);
