@@ -128,8 +128,14 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   const outErc = nativeOut ? null : new ethers.Contract(tokenOut, ["function balanceOf(address) view returns (uint256)"], provider);
   const outBal = async (): Promise<bigint> => (nativeOut ? provider.getBalance(w.address) : outErc!.balanceOf!(w.address).catch(() => 0n));
   const before = await outBal();
-  await provider.call({ to: env.kyberRouter, data: built.data, value, from: w.address }); // simulate
-  const tx = await w.sendTransaction({ to: env.kyberRouter, data: built.data, value, ...(await overrides()) });
+  await provider.call({ to: env.kyberRouter, data: built.data, value, from: w.address }); // simulate (unbounded gas)
+  // GAS: give the swap an explicit gasLimit = estimate × 2. The Kyber router runs the underlying pool
+  // swap via a low-level call and eth_estimateGas structurally UNDER-estimates that pattern (esp. v4 /
+  // hooked pools) — a bare estimate ran the inner call out of gas and the router reverted "Call failed"
+  // with gasUsed == gasLimit (233382). The 2× buffer absorbs the under-estimate + any state drift before
+  // inclusion; only gasUsed is actually paid, so over-provisioning the limit costs nothing.
+  const est = await provider.estimateGas({ to: env.kyberRouter, data: built.data, value, from: w.address }).catch(() => 300_000n);
+  const tx = await w.sendTransaction({ to: env.kyberRouter, data: built.data, value, gasLimit: est * 2n, ...(await overrides()) });
   await tx.wait();
   const after = await outBal();
   return { tx: tx.hash, amountOut: after > before ? after - before : 0n };
