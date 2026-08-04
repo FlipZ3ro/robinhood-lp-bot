@@ -203,7 +203,18 @@ export async function closeV4Position(tokenId: string, reason?: "TP" | "SL" | "O
       log.warn(`LP-vs-HODL basis failed #${tokenId}: ${e?.message ?? e} — falling back to ETH-funded basis`);
     }
   }
-  const pnlEth = basisEth != null && basisEth > 0 && pre ? outEth - basisEth : null;
+  // SANITY CLAMP: a farming position is funded ~0.003 ETH; even a moonshot closes at a few ETH. A
+  // pool-price token valuation (Uniswap SDK priceOf) on a thin / extreme-tick token can blow up to
+  // 1e50+ and poison the ledger + lifetime PnL (GME #462440 landed -$2.4e55, dwarfing every real
+  // trade). If any leg is non-finite or absurd, record the close with UNKNOWN pnl + zeroed legs so a
+  // single bad quote can't corrupt the aggregates.
+  const SANE_ETH = 100; // ~$186k — no single farming position is remotely near this
+  const valuationBroken = [outEth, feeEth, basisEth ?? 0].some((v) => !Number.isFinite(v) || Math.abs(v) > SANE_ETH);
+  if (valuationBroken) log.warn(`#${tokenId} ${pair}: valuasi rusak (out=${outEth} fee=${feeEth} basis=${basisEth}) → pnl direkam null, leg di-nol`);
+  const ledgerOut = valuationBroken ? 0 : outEth;
+  const ledgerFee = valuationBroken ? 0 : feeEth;
+  const ledgerBasis = valuationBroken ? 0 : basisEth ?? 0;
+  const pnlEth = !valuationBroken && basisEth != null && basisEth > 0 && pre ? outEth - basisEth : null;
   const pnlPct = pnlEth != null && basisEth ? (pnlEth / basisEth) * 100 : null;
 
   // record to the unified ledger (so /ledger shows v4 modal/PnL + counts it in stats)
@@ -218,9 +229,9 @@ export async function closeV4Position(tokenId: string, reason?: "TP" | "SL" | "O
       openedAt: dep?.ts ?? null,
       closedAt: Date.now(),
       heldMs: dep?.ts ? Date.now() - dep.ts : null,
-      depEth: basisEth ?? 0,
-      outEth,
-      feeEth,
+      depEth: ledgerBasis,
+      outEth: ledgerOut,
+      feeEth: ledgerFee,
       pnlEth,
       pnlPct,
       pnlUsd: pnlEth != null && px ? pnlEth * px : null,
