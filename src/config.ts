@@ -113,6 +113,10 @@ const AutoLpSchema = z.object({
   // hour drops below this × the 24h-average hour (spikeX < volFadeX = the spike is over → rotate out).
   // 0 = off. e.g. 0.35 = close when the current hour is under 35% of the pool's average hour.
   volFadeX: z.number().default(0),
+  // #3 volume-fade age guard: don't let VFADE close a position younger than this (minutes). Stops the
+  // "enter → instantly fade-exit" trap when the entry spike (minSpikeX) sits near volFadeX — the fresh
+  // position needs time to actually earn fees before a momentary volume dip is allowed to close it.
+  vfadeMinAgeMin: z.number().default(20),
   manageSec: z.number().int().positive().default(90), // manage-loop interval (seconds)
 });
 

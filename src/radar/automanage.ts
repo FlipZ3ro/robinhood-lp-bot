@@ -166,9 +166,10 @@ async function runManage(): Promise<void> {
       // every redeploy → 30-min-old parks never closing). inRange resets it (top of loop).
       if (!oorSince.has(it.tokenId)) oorSince.set(it.tokenId, it.ageMs != null ? now - it.ageMs : now);
       if (now - (oorSince.get(it.tokenId) ?? now) >= graceMs) reason = "OOR";
-    } else if (a.volFadeX > 0 && it.version === "v4" && it.inRange && it.poolId && it.ageMs != null && it.ageMs > 5 * 60_000) {
+    } else if (a.volFadeX > 0 && it.version === "v4" && it.inRange && it.poolId && it.ageMs != null && it.ageMs > (a.vfadeMinAgeMin || 20) * 60_000) {
       // #3 volume-fade: the spike is over (current hour < volFadeX × the 24h-avg hour) → rotate out.
-      // Age-guarded (>5m) so a fresh open isn't closed on a momentary dip; in-range only (OOR handles the rest).
+      // Age-guarded (>vfadeMinAgeMin) so a fresh open gets time to earn fees before a momentary volume
+      // dip can close it — otherwise, when the entry spike sits near volFadeX, it fade-exits instantly.
       if ((await poolSpikeX(it.tokenAddr, it.poolId)) < a.volFadeX) reason = "VFADE";
     }
     if (!reason) continue;
