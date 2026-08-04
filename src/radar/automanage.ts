@@ -143,7 +143,11 @@ async function runManage(): Promise<void> {
     const { listV4Positions } = await import("../chain/v4/list.js");
     const v4 = await listV4Positions().catch(() => []);
     for (const r of v4) {
-      const valEth = px > 0 ? r.valueUsd / px : null;
+      // valueUsd <= 0 means the position couldn't be valued THIS tick (cold tokenMeta right after a
+      // restart → wrong decimals → ~$0, or an unpriceable pool) — NOT a real $0 position (the quote
+      // side alone is always worth >$0). Leave pnl UNKNOWN (null) so a transient valuation miss can't
+      // fire a spurious TP/SL close. OOR/VFADE don't depend on pnl and still run.
+      const valEth = px > 0 && r.valueUsd > 0 ? r.valueUsd / px : null;
       const pnlEth = r.depEth != null && valEth != null ? valEth - r.depEth : null;
       const pnlPct = r.depEth && pnlEth != null ? (pnlEth / r.depEth) * 100 : null;
       items.push({ tokenId: r.tokenId, sym: r.sym, version: "v4", pnlPct, pnlEth, inRange: r.inRange, tokenAddr: r.tokenAddr, ageMs: r.ageMs, feeUsd: r.feeUsd, poolId: r.poolId });

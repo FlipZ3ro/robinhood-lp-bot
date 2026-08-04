@@ -183,17 +183,22 @@ export async function closeV4Position(tokenId: string, reason?: "TP" | "SL" | "O
         if (raw <= 0n) return 0;
         const a = addr.toLowerCase();
         const ui = Number(ethers.formatUnits(raw, dec));
-        if (a === NATIVE || a === WETH_L) return ui * px;
-        if (STABLES.has(a) || /usd/i.test(sym)) return ui;
-        try {
-          const inOther = Number(pool.priceOf(cur).quote(CurrencyAmount.fromRawAmount(cur, raw.toString())).toExact());
-          const oa = otherAddr.toLowerCase();
-          if (oa === NATIVE || oa === WETH_L) return inOther * px;
-          if (STABLES.has(oa) || /usd/i.test(otherSym)) return inOther;
-        } catch {
-          /* price out of range → skip */
+        let v = 0;
+        if (a === NATIVE || a === WETH_L) v = ui * px;
+        else if (STABLES.has(a) || /usd/i.test(sym)) v = ui;
+        else {
+          try {
+            const inOther = Number(pool.priceOf(cur).quote(CurrencyAmount.fromRawAmount(cur, raw.toString())).toExact());
+            const oa = otherAddr.toLowerCase();
+            if (oa === NATIVE || oa === WETH_L) v = inOther * px;
+            else if (STABLES.has(oa) || /usd/i.test(otherSym)) v = inOther;
+          } catch {
+            /* price out of range → skip */
+          }
         }
-        return 0;
+        // SANITY: clamp an exploded pool-price valuation (thin / extreme-tick) — same guard as list.ts
+        // sideUsd; keeps basisEth sane so the ledger clamp below stays a backstop, not the primary catch.
+        return Number.isFinite(v) && Math.abs(v) < 1e6 ? v : 0;
       };
       const hodlUsd =
         valUsd(c0, m0.decimals, m0.symbol, BigInt(dep.dep0), cur0, c1, m1.symbol) +

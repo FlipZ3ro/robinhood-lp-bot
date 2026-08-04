@@ -285,8 +285,13 @@ export async function listV4Positions(staleOkMs = 0): Promise<V4Row[]> {
       const u1 = usdOfCurrency(c1, m1.symbol, px);
       const sideUsd = (amt: any, thisUsd: number | null, otherUsd: number | null): number => {
         try {
-          if (thisUsd != null) return Number(amt.toExact()) * thisUsd;
-          if (otherUsd != null) return Number(pool.priceOf(amt.currency).quote(amt).toExact()) * otherUsd;
+          let v = 0;
+          if (thisUsd != null) v = Number(amt.toExact()) * thisUsd;
+          else if (otherUsd != null) v = Number(pool.priceOf(amt.currency).quote(amt).toExact()) * otherUsd;
+          // SANITY: pool.priceOf on a thin / extreme-tick pool can explode to 1e50+, poisoning valueUsd
+          // (→ automanage pnlPct → a spurious SL close) + feeUsd (→ compound) + the close ledger (pre).
+          // No single farming-position leg is near $1M, so treat a blown-up value as unvaluable (0).
+          return Number.isFinite(v) && Math.abs(v) < 1e6 ? v : 0;
         } catch {
           /* price edge */
         }
