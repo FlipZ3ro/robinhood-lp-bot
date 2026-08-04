@@ -1850,7 +1850,8 @@ const AUTOLP_NUM_MAP: Record<string, keyof typeof cfg.autoLp> = {
   alpoorcount: "oorCooldownCount",
   alpoorhours: "oorCooldownHours",
   alpcompoundmin: "compoundMinUsd", // min uncollected fees ($) before compounding
-  alpvolfade: "volFadeX", // #3 volume-fade exit: close when spikeX < this (0 = off)
+  alpvolfade: "volFadeX", // #3 volume-fade exit: close when spikeX < this (0 = off). MUST be < scan.minSpikeX
+  alpvfadeage: "vfadeMinAgeMin", // #3 volume-fade age guard (min): no VFADE close before a position is this old
 };
 const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
   huntvol: "minVolUsd",
@@ -1865,7 +1866,7 @@ const SCAN_NUM_MAP: Record<string, keyof typeof cfg.scan> = {
   huntcooldown: "cooldownMin", // menit sebelum token yg udah di-alert boleh muncul lagi (rotasi cepet = kecil)
 };
 const SET_HELP =
-  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax, huntpoolliq, huntmaxratio, huntspike, huntcooldown\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours, alpcompoundmin · alpmode single|inrange · alpclose 0/1 · alprebalance close|rebalance · alpcompound 0/1";
+  "LP: width, deposit, slippage, gastarget\nWatch: vol5m, vol1h, rise, liq, tax, cooldown, interval\nFeed: minseed, activity, feedcooldown · toggle: newtoken/posmon/autoclose (0/1)\nRadar: radar/gmgn (0/1)\nHunt: huntvol, huntfees, huntyield, huntscore, huntmcapmin, huntmcapmax, huntpoolliq, huntmaxratio, huntspike, huntcooldown\nAuto-LP: alpsize, alpscore, alpmaxopen, alpperhour, alpdaily, alpminliq, alpmaxtax, alpgrace, alpoorcount, alpoorhours, alpcompoundmin, alpvolfade, alpvfadeage · alpmode single|inrange · alpclose 0/1 · alprebalance close|rebalance · alpcompound 0/1";
 
 export async function onSet(text: string): Promise<void> {
   const [, k, v] = text.split(/\s+/);
