@@ -117,6 +117,12 @@ const AutoLpSchema = z.object({
   // "enter → instantly fade-exit" trap when the entry spike (minSpikeX) sits near volFadeX — the fresh
   // position needs time to actually earn fees before a momentary volume dip is allowed to close it.
   vfadeMinAgeMin: z.number().default(20),
+  // fee-velocity exit: close an IN-RANGE position whose RECENT fee-earning rate ($/h, measured over a
+  // rolling window) drops below this floor → the pool stopped being productive, so evict it and free the
+  // slot for a live candidate. 0 = off. The direct "is this LP actually earning?" signal, complementing
+  // the volume-proxy volFadeX. feeGraceMin protects a slow-starter from being cut too early.
+  minFeePerHourUsd: z.number().default(0),
+  feeGraceMin: z.number().default(30), // min position age (min) before fee-velocity can fire
   manageSec: z.number().int().positive().default(90), // manage-loop interval (seconds)
 });
 

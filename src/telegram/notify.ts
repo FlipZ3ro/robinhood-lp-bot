@@ -160,9 +160,9 @@ export async function notifyAutoLp(r: AutoLpResult): Promise<void> {
 
 /** Auto-manage closed a position (take-profit / stop-loss / out-of-range). */
 export async function notifyAutoClose(i: AutoCloseInfo): Promise<void> {
-  const emo = i.reason === "TP" ? "🎯💰" : i.reason === "SL" ? "🛑" : i.reason === "VFADE" ? "📉" : "🚪";
+  const emo = i.reason === "TP" ? "🎯💰" : i.reason === "SL" ? "🛑" : i.reason === "VFADE" ? "📉" : i.reason === "FVLOW" ? "🐌" : "🚪";
   const label =
-    i.reason === "TP" ? "TAKE PROFIT" : i.reason === "SL" ? "STOP LOSS" : i.reason === "VFADE" ? "VOLUME FADE" : "OUT OF RANGE";
+    i.reason === "TP" ? "TAKE PROFIT" : i.reason === "SL" ? "STOP LOSS" : i.reason === "VFADE" ? "VOLUME FADE" : i.reason === "FVLOW" ? "FEE MATI (rotasi slot)" : "OUT OF RANGE";
   const pnl =
     i.pnlPct != null
       ? `${i.pnlPct >= 0 ? "+" : ""}${i.pnlPct.toFixed(1)}%${i.pnlEth != null ? ` (${i.pnlEth >= 0 ? "+" : ""}${i.pnlEth.toFixed(6)}Ξ)` : ""}`

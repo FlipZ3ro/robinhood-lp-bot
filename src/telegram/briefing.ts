@@ -39,7 +39,7 @@ const clip = (s: string, n = 24) => (s.length > n ? s.slice(0, n - 1) + "…" : 
 // Ledger entries closed BEFORE the `reason` field existed default to "manual". Infer a meaningful
 // close reason from the realized PnL vs the configured TP/SL bands so historical days still read
 // sensibly (going forward, auto-closes carry the real TP/SL/OOR/VFADE reason and this is a no-op).
-function effReason(e: LedgerEntry): "TP" | "SL" | "OOR" | "VFADE" | "manual" {
+function effReason(e: LedgerEntry): "TP" | "SL" | "OOR" | "VFADE" | "FVLOW" | "manual" {
   if (e.reason && e.reason !== "manual") return e.reason;
   const p = e.pnlPct;
   if (p == null) return e.reason ?? "manual";
@@ -298,6 +298,7 @@ export async function buildBriefing(): Promise<string> {
       ["🎯", "TAKE-PROFIT", "TP"],
       ["🛑", "STOP-LOSS", "SL"],
       ["📉", "VOLUME-FADE", "VFADE"],
+      ["🐌", "FEE-MATI (rotasi)", "FVLOW"],
       ["✋", "MANUAL", "manual"],
     ];
     for (const [emo, label, reason] of groups) {

@@ -130,7 +130,7 @@ export interface LedgerEntry {
   tokenRug: number;
   unsoldEth?: number;
   source?: "onchain" | "bot";
-  reason?: "TP" | "SL" | "OOR" | "VFADE" | "manual"; // why the position was closed (for the daily briefing)
+  reason?: "TP" | "SL" | "OOR" | "VFADE" | "FVLOW" | "manual"; // why the position was closed (for the daily briefing)
 }
 
 /** A token that passed every watch filter + safety check. */

@@ -16,7 +16,13 @@ import { logger } from "../util/log.js";
 
 const log = logger("automanage");
 
-export type CloseReason = "TP" | "SL" | "OOR" | "VFADE";
+export type CloseReason = "TP" | "SL" | "OOR" | "VFADE" | "FVLOW";
+
+// fee-velocity exit: rolling {uncollected fee $, ts} snapshot per position, so we can measure the
+// RECENT fee-earning rate ($/h) over a window rather than a lagging cumulative average — catches a
+// pool that earned well then died, not just one that was never productive.
+const feeSnap = new Map<string, { fee: number; ts: number }>();
+const FVLOW_WINDOW_MS = Number(process.env.RH_FVLOW_WINDOW_MS) || 15 * 60_000; // measure the rate over ≥ this
 export interface AutoCloseInfo {
   tokenId: string;
   sym: string;
@@ -57,7 +63,7 @@ const NUDGE_MIN_MS = Number(process.env.RH_NUDGE_MS) || 30_000;
 /** Any manage action armed? (loop is a no-op otherwise, even when /auto is ON.) */
 function armed(): boolean {
   const a = cfg.autoLp;
-  return a.tpPct > 0 || a.slPct > 0 || a.closeOor || a.compound || a.volFadeX > 0;
+  return a.tpPct > 0 || a.slPct > 0 || a.closeOor || a.compound || a.volFadeX > 0 || a.minFeePerHourUsd > 0;
 }
 
 export function startManage(h?: ManageHooks): void {
@@ -156,10 +162,28 @@ async function runManage(): Promise<void> {
     /* v4 list optional */
   }
 
+  // drop fee-velocity snapshots for positions that are no longer open (closed → free the memory)
+  const liveIds = new Set(items.map((i) => i.tokenId));
+  for (const id of feeSnap.keys()) if (!liveIds.has(id)) feeSnap.delete(id);
+
   const graceMs = (a.oorGraceMin || 0) * 60_000;
   for (const it of items) {
     if (it.inRange) oorSince.delete(it.tokenId); // back in range → reset the OOR grace timer
     if (closing.has(it.tokenId)) continue;
+
+    // fee-velocity: roll the rolling snapshot EVERY tick (independent of the close cascade) so the
+    // window matures; once it does, feeRate = recent $/h earned. Fee dropping (a compound/collect)
+    // restarts the window instead of reading a spurious negative rate.
+    let feeRate: number | null = null;
+    if (a.minFeePerHourUsd > 0 && it.version === "v4" && it.inRange && it.feeUsd != null) {
+      const snap = feeSnap.get(it.tokenId);
+      if (!snap || it.feeUsd < snap.fee) feeSnap.set(it.tokenId, { fee: it.feeUsd, ts: now });
+      else if (now - snap.ts >= FVLOW_WINDOW_MS) {
+        feeRate = (it.feeUsd - snap.fee) / ((now - snap.ts) / 3_600_000);
+        feeSnap.set(it.tokenId, { fee: it.feeUsd, ts: now }); // start the next window
+      }
+    }
+
     let reason: CloseReason | null = null;
     if (a.tpPct > 0 && it.pnlPct != null && it.pnlPct >= a.tpPct) reason = "TP";
     else if (a.slPct > 0 && it.pnlPct != null && it.pnlPct <= -a.slPct) reason = "SL";
@@ -175,6 +199,21 @@ async function runManage(): Promise<void> {
       // Age-guarded (>vfadeMinAgeMin) so a fresh open gets time to earn fees before a momentary volume
       // dip can close it — otherwise, when the entry spike sits near volFadeX, it fade-exits instantly.
       if ((await poolSpikeX(it.tokenAddr, it.poolId)) < a.volFadeX) reason = "VFADE";
+    } else if (
+      a.minFeePerHourUsd > 0 &&
+      it.version === "v4" &&
+      it.inRange &&
+      it.ageMs != null &&
+      it.ageMs > (a.feeGraceMin || 30) * 60_000 &&
+      feeRate != null &&
+      feeRate < a.minFeePerHourUsd
+    ) {
+      // fee-velocity exit: the position's RECENT fee earnings ($/h over the last window) fell below the
+      // floor → the pool stopped being productive. Evict it so the slot rotates to a live candidate.
+      // Age-graced (feeGraceMin) so a slow-starter isn't cut, and windowed so a momentary lull doesn't
+      // fire it. Complements VFADE (volume proxy) with the direct signal: is this LP actually earning?
+      log.info(`FVLOW #${it.tokenId} ${it.sym}: fee-rate $${feeRate.toFixed(3)}/h < $${a.minFeePerHourUsd}/h`);
+      reason = "FVLOW";
     }
     if (!reason) continue;
     closing.add(it.tokenId);
