@@ -80,6 +80,29 @@ export function wallet(): ethers.Wallet {
  * Gas overrides. Robinhood base fee moves per block; if maxFee is too tight the tx is
  * rejected ("max fee < base fee") and hangs → close/mint never lands. Buffer 3×.
  */
+/**
+ * Await a tx receipt with a HARD TIMEOUT. ethers' tx.wait() hangs forever if the RPC flaps (503 /
+ * dropped connection / rate-limit) mid-confirmation. Every open/close holds the shared wallet lock
+ * while waiting, so ONE hung confirmation deadlocks the WHOLE bot — no further opens/closes — until a
+ * manual restart (observed: a 503 during a TP close wedged the bot ~25min). Racing a timeout turns the
+ * hang into a throw, which the caller's existing catch converts into a lock-release + next-tick retry
+ * (the manage loop re-reads on-chain state, so a retry adapts to whatever actually landed). On the
+ * fast-submit sequencer, confirmations arrive in seconds, so this never fires in normal operation.
+ * Tune via RH_TX_WAIT_MS.
+ */
+const TX_WAIT_MS = Number(process.env.RH_TX_WAIT_MS) || 75_000;
+export async function waitTx(tx: ethers.TransactionResponse, label = "tx"): Promise<ethers.TransactionReceipt | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`tx.wait timeout ${TX_WAIT_MS}ms (${label}) hash=${tx.hash}`)), TX_WAIT_MS);
+  });
+  try {
+    return await Promise.race([tx.wait(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function overrides(): Promise<ethers.Overrides> {
   if (Number(cfg.gasPriceGwei) > 0) {
     return { gasPrice: ethers.parseUnits(String(cfg.gasPriceGwei), "gwei") };

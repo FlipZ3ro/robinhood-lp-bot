@@ -12,7 +12,7 @@ import { ethers } from "ethers";
 import sdkCore from "@uniswap/sdk-core";
 import v4sdk from "@uniswap/v4-sdk";
 import { C, cfg } from "../../config.js";
-import { wallet, provider, overrides } from "../client.js";
+import { wallet, provider, overrides, waitTx } from "../client.js";
 import { tokenMeta } from "../tokens.js";
 import { discoverV4Pools, pickV4Pool, USDG, type V4Pool } from "./discover.js";
 import { swapEthToTokenV4, quoteV4 } from "./swap.js";
@@ -73,7 +73,7 @@ async function ensureNativeEth(needWei: bigint): Promise<void> {
     );
   }
   log.info(`unwrap ${ethers.formatEther(short)} WETH → ETH native (v4 butuh native)`);
-  await (await weth.withdraw!(short, await overrides())).wait();
+  await waitTx(await weth.withdraw!(short, await overrides()), "v4-unwrap");
 }
 
 function buildSdkPool(token: string, decimals: number, symbol: string, pool: V4Pool) {
@@ -141,7 +141,7 @@ export async function openV4SingleSide(
   }
 
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
-  const rc = await tx.wait();
+  const rc = await waitTx(tx, "v4-mint");
   const tokenId = tokenIdFromReceipt(rc!);
   if (tokenId) {
     saveV4Deposit(tokenId, {
@@ -283,11 +283,11 @@ export async function openV4InRange(
 
   // 3) approve token via Permit2 (ERC20 → Permit2, Permit2 → PositionManager)
   if ((await erc.allowance!(w.address, PERMIT2)) < tokenBal) {
-    await (await erc.approve!(PERMIT2, ethers.MaxUint256, await overrides())).wait();
+    await waitTx(await erc.approve!(PERMIT2, ethers.MaxUint256, await overrides()), "v4-approve-permit2");
   }
   const permit2 = new ethers.Contract(PERMIT2, ["function approve(address token,address spender,uint160 amount,uint48 expiration)"], w);
   const exp = Math.floor(Date.now() / 1000) + 30 * 86400;
-  await (await permit2.approve!(token, C.v4PositionManager!, (1n << 160n) - 1n, exp, await overrides())).wait();
+  await waitTx(await permit2.approve!(token, C.v4PositionManager!, (1n << 160n) - 1n, exp, await overrides()), "v4-permit2");
 
   // RE-READ fresh pool state after the swap (it moved the price) and re-anchor the range on the live
   // tick. Building against the stale pre-swap price forced a big slippage buffer that left ~15% of
@@ -351,7 +351,7 @@ export async function openV4InRange(
     throw new Error(`simulasi mint v4 in-range revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
   }
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
-  const rc = await tx.wait();
+  const rc = await waitTx(tx, "v4-mint");
   const tokenId = tokenIdFromReceipt(rc!);
   // deposit basis = the position's actual value at mint (native side + token side valued in ETH),
   // so reused inventory is counted honestly in PnL
@@ -409,11 +409,11 @@ export async function approveViaPermit2(tokenAddr: string): Promise<void> {
   const w = wallet();
   const erc = new ethers.Contract(tokenAddr, ["function allowance(address,address) view returns (uint256)", "function approve(address,uint256) returns (bool)"], w);
   if ((await erc.allowance!(w.address, PERMIT2)) < (1n << 200n)) {
-    await (await erc.approve!(PERMIT2, ethers.MaxUint256, await overrides())).wait();
+    await waitTx(await erc.approve!(PERMIT2, ethers.MaxUint256, await overrides()), "v4-approve-permit2");
   }
   const permit2 = new ethers.Contract(PERMIT2, ["function approve(address token,address spender,uint160 amount,uint48 expiration)"], w);
   const exp = Math.floor(Date.now() / 1000) + 30 * 86400;
-  await (await permit2.approve!(tokenAddr, C.v4PositionManager!, (1n << 160n) - 1n, exp, await overrides())).wait();
+  await waitTx(await permit2.approve!(tokenAddr, C.v4PositionManager!, (1n << 160n) - 1n, exp, await overrides()), "v4-permit2");
 }
 
 /**
@@ -534,7 +534,7 @@ export async function openV4UsdgInRange(
     throw new Error(`simulasi ${opts?.increaseTokenId ? "increase" : "mint"} v4 USDG revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
   }
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
-  const rc = await tx.wait();
+  const rc = await waitTx(tx, "v4-mint");
   const tokenId = opts?.increaseTokenId ?? tokenIdFromReceipt(rc!);
   if (tokenId) {
     // record DEPOSITED amounts (LP-vs-HODL basis). On INCREASE, ADD to the existing record so the
@@ -694,7 +694,7 @@ export async function openV4UsdgSingleSide(pool: V4Pool, amountEthStr: string): 
     throw new Error(`simulasi single-side USDG revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
   }
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
-  const rc = await tx.wait();
+  const rc = await waitTx(tx, "v4-mint");
   const tokenId = tokenIdFromReceipt(rc!);
   if (tokenId) {
     saveV4Deposit(tokenId, {

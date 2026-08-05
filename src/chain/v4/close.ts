@@ -7,7 +7,7 @@ import { ethers } from "ethers";
 import sdkCore from "@uniswap/sdk-core";
 import v4sdk from "@uniswap/v4-sdk";
 import { C, cfg } from "../../config.js";
-import { wallet, provider, overrides } from "../client.js";
+import { wallet, provider, overrides, waitTx } from "../client.js";
 import { tokenMeta } from "../tokens.js";
 import { STATEVIEW_ABI, V4_POSM_ABI } from "./abis.js";
 import { NATIVE } from "./poolkey.js";
@@ -67,7 +67,7 @@ async function simulateAndSend(calldata: string, value: string, label: string): 
     throw new Error(`simulasi ${label} v4 revert: ${((e as any).shortMessage || (e as Error).message || "").slice(0, 140)}`);
   }
   const tx = await w.sendTransaction({ to: C.v4PositionManager!, data: calldata, value: BigInt(value), ...(await overrides()) });
-  await tx.wait();
+  await waitTx(tx, `v4-${label}`);
   return tx.hash;
 }
 

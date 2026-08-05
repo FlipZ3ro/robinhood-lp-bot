@@ -12,7 +12,7 @@
  */
 import { ethers } from "ethers";
 import { env, cfg } from "../config.js";
-import { wallet, provider, overrides } from "./client.js";
+import { wallet, provider, overrides, waitTx } from "./client.js";
 import { logger } from "../util/log.js";
 
 const log = logger("kyber");
@@ -119,7 +119,7 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   if (!nativeIn) {
     const erc = new ethers.Contract(tokenIn, ["function allowance(address,address) view returns (uint256)", "function approve(address,uint256) returns (bool)"], w);
     if ((await erc.allowance!(w.address, env.kyberRouter)) < amountIn) {
-      await (await erc.approve!(env.kyberRouter, amountIn, await overrides())).wait();
+      await waitTx(await erc.approve!(env.kyberRouter, amountIn, await overrides()), "kyber-approve");
     }
   }
 
@@ -136,7 +136,7 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   // inclusion; only gasUsed is actually paid, so over-provisioning the limit costs nothing.
   const est = await provider.estimateGas({ to: env.kyberRouter, data: built.data, value, from: w.address }).catch(() => 300_000n);
   const tx = await w.sendTransaction({ to: env.kyberRouter, data: built.data, value, gasLimit: est * 2n, ...(await overrides()) });
-  await tx.wait();
+  await waitTx(tx, "kyber-swap");
   const after = await outBal();
   return { tx: tx.hash, amountOut: after > before ? after - before : 0n };
 }
