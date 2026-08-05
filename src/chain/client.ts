@@ -42,9 +42,21 @@ class SequencerRoutingProvider extends ethers.JsonRpcProvider {
   }
 }
 
+// Per-request RPC timeout. ethers' FetchRequest defaults to a 300s (5-minute!) timeout, so when the
+// public RPC flaps — 503s, dead sockets that accept but never respond — a single read STALLS for five
+// minutes while holding the shared wallet lock → the whole bot wedges (observed repeatedly). A 20s cap
+// makes every RPC call (reads AND the tx.wait receipt polls) fast-fail on a hang → the operation throws
+// → the caller releases the lock + retries next tick. Pairs with waitTx() (overall confirmation cap).
+// Tune via RH_RPC_TIMEOUT_MS.
+function rpcReq(url: string): ethers.FetchRequest {
+  const req = new ethers.FetchRequest(url);
+  req.timeout = Number(process.env.RH_RPC_TIMEOUT_MS) || 20_000;
+  return req;
+}
+
 export const provider: ethers.JsonRpcProvider = env.fastSubmit
-  ? new SequencerRoutingProvider(env.rpcUrl, cfg.chainId)
-  : new ethers.JsonRpcProvider(env.rpcUrl, cfg.chainId);
+  ? new SequencerRoutingProvider(rpcReq(env.rpcUrl), cfg.chainId)
+  : new ethers.JsonRpcProvider(rpcReq(env.rpcUrl), cfg.chainId);
 
 // Robinhood blocks are SUB-SECOND, but ethers' default pollingInterval is 4s → tx.wait() only
 // notices a mined receipt on the next 4s poll. A multi-tx close/add/swap (5 txs) then wastes up to
@@ -55,7 +67,7 @@ if (env.fastSubmit) log.info(`fast-submit ON → ${env.sequencerUrl}${env.sequen
 
 export const usingOwnWatchRpc = !!env.watchRpcUrl;
 export const watchProvider = env.watchRpcUrl
-  ? new ethers.JsonRpcProvider(env.watchRpcUrl, cfg.chainId)
+  ? new ethers.JsonRpcProvider(rpcReq(env.watchRpcUrl), cfg.chainId)
   : provider;
 
 // Dedicated provider for v4 discovery getLogs (see rpcInitLogs). Full-range getLogs is the heaviest,
@@ -63,7 +75,7 @@ export const watchProvider = env.watchRpcUrl
 // from slowing the main provider that mint/close depend on. Falls back to `provider` when unset.
 export const usingOwnLogsRpc = !!env.logsRpcUrl;
 export const logsProvider: ethers.JsonRpcProvider = env.logsRpcUrl
-  ? new ethers.JsonRpcProvider(env.logsRpcUrl, cfg.chainId)
+  ? new ethers.JsonRpcProvider(rpcReq(env.logsRpcUrl), cfg.chainId)
   : provider;
 if (usingOwnWatchRpc || usingOwnLogsRpc) log.info(`RPC split — watch:${usingOwnWatchRpc ? "own" : "main"} · logs:${usingOwnLogsRpc ? "own" : "main"}`);
 
