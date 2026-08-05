@@ -177,10 +177,16 @@ async function runManage(): Promise<void> {
     let feeRate: number | null = null;
     if (a.minFeePerHourUsd > 0 && it.version === "v4" && it.inRange && it.feeUsd != null) {
       const snap = feeSnap.get(it.tokenId);
-      if (!snap || it.feeUsd < snap.fee) feeSnap.set(it.tokenId, { fee: it.feeUsd, ts: now });
+      // NOTE feeUsd = uncollected-fee AMOUNT × token price, so it wobbles DOWN when the token price
+      // dips even though fees only accrue. Only restart the window on a COLLAPSE (> 50% drop = a
+      // compound/collect zeroed it) — a price wobble stays well above half, so the window still matures.
+      // (The old `feeUsd < snap.fee` reset fired on every price tick → the window never matured for
+      // exactly the low-fee positions FVLOW is meant to catch.)
+      if (!snap || it.feeUsd < snap.fee * 0.5) feeSnap.set(it.tokenId, { fee: it.feeUsd, ts: now });
       else if (now - snap.ts >= FVLOW_WINDOW_MS) {
         feeRate = (it.feeUsd - snap.fee) / ((now - snap.ts) / 3_600_000);
         feeSnap.set(it.tokenId, { fee: it.feeUsd, ts: now }); // start the next window
+        log.info(`fee-eval #${it.tokenId} ${it.sym}: rate $${feeRate.toFixed(3)}/h (floor $${a.minFeePerHourUsd}) age ${it.ageMs != null ? (it.ageMs / 60000).toFixed(0) : "?"}m`);
       }
     }
 
@@ -199,7 +205,15 @@ async function runManage(): Promise<void> {
       // Age-guarded (>vfadeMinAgeMin) so a fresh open gets time to earn fees before a momentary volume
       // dip can close it — otherwise, when the entry spike sits near volFadeX, it fade-exits instantly.
       if ((await poolSpikeX(it.tokenAddr, it.poolId)) < a.volFadeX) reason = "VFADE";
-    } else if (
+    }
+    // fee-velocity exit — a STANDALONE check, NOT chained after VFADE: VFADE's outer `else if` condition
+    // (any in-range mature v4 position) is true for EVERY in-range position, so an `else if` after it
+    // would never be reached — FVLOW would silently never fire. Gated on `!reason` so a higher-priority
+    // TP/SL/OOR/VFADE still wins. The position's RECENT fee-rate ($/h over the window) fell below the
+    // floor → the pool stopped being productive → evict it so the slot rotates to a live candidate.
+    // Age-graced (feeGraceMin) so a slow-starter isn't cut. The direct "is this LP actually earning?".
+    if (
+      !reason &&
       a.minFeePerHourUsd > 0 &&
       it.version === "v4" &&
       it.inRange &&
@@ -208,10 +222,6 @@ async function runManage(): Promise<void> {
       feeRate != null &&
       feeRate < a.minFeePerHourUsd
     ) {
-      // fee-velocity exit: the position's RECENT fee earnings ($/h over the last window) fell below the
-      // floor → the pool stopped being productive. Evict it so the slot rotates to a live candidate.
-      // Age-graced (feeGraceMin) so a slow-starter isn't cut, and windowed so a momentary lull doesn't
-      // fire it. Complements VFADE (volume proxy) with the direct signal: is this LP actually earning?
       log.info(`FVLOW #${it.tokenId} ${it.sym}: fee-rate $${feeRate.toFixed(3)}/h < $${a.minFeePerHourUsd}/h`);
       reason = "FVLOW";
     }
