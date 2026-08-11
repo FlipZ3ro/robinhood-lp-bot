@@ -130,7 +130,7 @@ Sekarang buka `.env`, isi:
 
 | Isi apa | Dapetnya dari mana |
 |---|---|
-| `RH_RPC_URL` | [alchemy.com](https://alchemy.com) → bikin app → pilih chain **Robinhood** → copy HTTPS URL |
+| `RH_RPC_URL` | [alchemy.com](https://alchemy.com) atau [chainstack.com](https://chainstack.com/build-better-with-robinhood-chain/) → bikin app → pilih chain **Robinhood** → copy HTTPS URL |
 | `RH_WALLET_KEY` | Private key wallet EVM lu. **Pakai wallet baru/burner**, jangan wallet utama |
 | `RH_TG_TOKEN` | Chat [@BotFather](https://t.me/BotFather) di Telegram → `/newbot` → copy token |
 | `RH_TG_CHAT` | **Owner chat id — GERBANG KEAMANAN.** Chat [@userinfobot](https://t.me/userinfobot) buat dapet id lu. Cuma chat ini yang boleh nyuruh bot |
