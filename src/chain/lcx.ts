@@ -12,7 +12,8 @@
  *   5. tx value == amountIn for native ETH, else 0
  *   6. the CALLDATA itself (checkLcxCalldata): decodes as one of the router's 5 entrypoints and pays
  *      exactly what was asked — recipient = wallet, totalIn = amountIn, same tokens, floor >= quote
- *      floor, matching value, live deadline, and a makerSwap leg only ever targets Bebop
+ *      floor, matching value, live deadline, no integrator fee, and a makerSwap leg that is either
+ *      Bebop or empty
  */
 import { ethers } from "ethers";
 import { env, cfg } from "../config.js";
@@ -72,10 +73,18 @@ export function checkLcxCalldata(data: string, value: bigint, x: LcxExpect, nowS
   if (value !== (same(x.tokenIn, LCX_NATIVE) ? totalIn : 0n)) return `value ${value} ≠ ${same(x.tokenIn, LCX_NATIVE) ? totalIn : 0n}`;
   if (a.deadline <= BigInt(nowSec)) return "deadline passed";
   if (tx.name === "makerSwap") {
+    // maker leg: Bebop target AND spender, or a fully empty leg. amountIn == 0 alone is NOT an exemption.
     const m: any = tx.args[2];
-    if (m.amountIn > 0n && (!BEBOP.has(m.target.toLowerCase()) || !BEBOP.has(m.spender.toLowerCase()) || m.amountIn > totalIn)) {
-      return `makerSwap leg not allowed (target ${m.target})`;
-    }
+    const bebop = BEBOP.has(m.target.toLowerCase()) && BEBOP.has(m.spender.toLowerCase());
+    const empty = m.amountIn === 0n && same(m.target, ethers.ZeroAddress) && same(m.spender, ethers.ZeroAddress) && m.data === "0x";
+    if (!(bebop || empty)) return `makerSwap leg not allowed (target ${m.target})`;
+    if (m.amountIn > totalIn) return `makerSwap leg ${m.amountIn} > totalIn`;
+  } else if (tx.name !== "swapSplit") {
+    // wrappers: we never ask for an integrator, so none may take a fee
+    if (!same(a.integrator, ethers.ZeroAddress)) return `integrator ${a.integrator} ≠ zero`;
+    // the prop-AMM venue needs no allowlist: the router's final minAmountOut check reverts the whole tx
+    // unless the recipient gets the floor checked above
+    if (tx.name === "swapSplitWithPropAMMSplit" && tx.args[3].venueIn > totalIn) return `venueIn ${tx.args[3].venueIn} > totalIn`;
   }
   return "";
 }

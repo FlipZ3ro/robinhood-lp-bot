@@ -26,27 +26,33 @@ const DEADLINE = BigInt(NOW + 120);
 type Args = { tokenIn: string; tokenOut: string; totalIn: bigint; minAmountOut: bigint; recipient: string; deadline: bigint };
 const base = (over: Partial<Args> = {}): Args => ({ tokenIn: USDG, tokenOut: LCX_NATIVE, totalIn: AMT, minAmountOut: MIN, recipient: ME, deadline: DEADLINE, ...over });
 const legs = (a: Args) => [{ amountIn: a.totalIn, hops: [{ family: 1, pool: OTHER, tokenIn: a.tokenIn, tokenOut: a.tokenOut, aux: 0n }] }];
-const feeArgs = (a: Args) => ({ ...a, integrator: LCX_NATIVE });
+const ZERO = "0x0000000000000000000000000000000000000000";
+const feeArgs = (a: Args, integrator = ZERO) => ({ ...a, integrator });
 
 const swapSplit = (over: Partial<Args> = {}) => {
   const a = base(over);
   return LCX_ROUTER_IFACE.encodeFunctionData("swapSplit", [a.tokenIn, a.tokenOut, a.totalIn, a.minAmountOut, a.recipient, a.deadline, legs(a)]);
 };
-const propAmmSplit = (over: Partial<Args> = {}) => {
-  const a = base(over);
-  return LCX_ROUTER_IFACE.encodeFunctionData("swapSplitWithPropAMMSplit", [feeArgs(a), legs(a), legs(a), { venue: OTHER, venueIn: a.totalIn / 2n, venueMinOut: 1n }]);
+const withFee = (integrator = ZERO) => {
+  const a = base();
+  return LCX_ROUTER_IFACE.encodeFunctionData("swapSplitWithFee", [feeArgs(a, integrator), legs(a)]);
 };
-const viaPropAmm = (over: Partial<Args> = {}) => {
+const propAmmSplit = (over: Partial<Args> = {}, venueIn = AMT / 2n, integrator = ZERO) => {
   const a = base(over);
-  return LCX_ROUTER_IFACE.encodeFunctionData("swapSplitViaPropAMM", [feeArgs(a), legs(a), OTHER, a.minAmountOut]);
+  return LCX_ROUTER_IFACE.encodeFunctionData("swapSplitWithPropAMMSplit", [feeArgs(a, integrator), legs(a), legs(a), { venue: OTHER, venueIn, venueMinOut: 1n }]);
 };
-const makerSwap = (target: string, over: Partial<Args> = {}) => {
+const viaPropAmm = (over: Partial<Args> = {}, integrator = ZERO) => {
   const a = base(over);
+  return LCX_ROUTER_IFACE.encodeFunctionData("swapSplitViaPropAMM", [feeArgs(a, integrator), legs(a), OTHER, a.minAmountOut]);
+};
+type Maker = { target: string; spender: string; amountIn: bigint; data: string };
+const makerSwap = (target: string, m: Partial<Maker> = {}) => {
+  const a = base();
   const { totalIn, ...rest } = a;
   return LCX_ROUTER_IFACE.encodeFunctionData("makerSwap", [
     { ...rest, amountIn: totalIn },
     [],
-    { target, spender: target, amountIn: totalIn, minOut: a.minAmountOut, data: "0x" },
+    { target, spender: target, amountIn: totalIn, minOut: a.minAmountOut, data: "0x", ...m },
     legs(a),
   ]);
 };
@@ -165,6 +171,30 @@ test("calldata: an expired deadline is refused", () => {
 
 test("calldata: makerSwap with a non-Bebop target is refused", () => {
   assert.match(check(makerSwap(OTHER)), /makerSwap/);
+  assert.match(check(makerSwap(BEBOP, { spender: OTHER })), /makerSwap/);
+  assert.match(check(makerSwap(BEBOP, { amountIn: AMT + 1n })), /makerSwap/);
+});
+
+test("calldata: makerSwap with a non-Bebop target is refused even when its amountIn is 0", () => {
+  assert.match(check(makerSwap(OTHER, { amountIn: 0n })), /makerSwap/);
+  assert.match(check(makerSwap(ZERO, { amountIn: 0n, spender: OTHER })), /makerSwap/);
+  assert.match(check(makerSwap(ZERO, { amountIn: 0n, data: "0x01" })), /makerSwap/);
+});
+
+test("calldata: makerSwap with a fully empty maker leg is accepted", () => {
+  assert.equal(check(makerSwap(ZERO, { amountIn: 0n })), "");
+});
+
+test("calldata: wrappers with a non-zero integrator are refused", () => {
+  assert.equal(check(withFee()), "");
+  assert.match(check(withFee(OTHER)), /integrator/);
+  assert.match(check(viaPropAmm({}, OTHER)), /integrator/);
+  assert.match(check(propAmmSplit({}, AMT / 2n, OTHER)), /integrator/);
+});
+
+test("calldata: swapSplitWithPropAMMSplit with venueIn > totalIn is refused", () => {
+  assert.equal(check(propAmmSplit({}, AMT)), "");
+  assert.match(check(propAmmSplit({}, AMT + 1n)), /venueIn/);
 });
 
 // ── lcxPlan: HTTP + JSON gates ──
