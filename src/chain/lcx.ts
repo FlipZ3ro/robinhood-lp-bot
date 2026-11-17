@@ -10,7 +10,11 @@
  *   3. the quote echoes the request: same tokenIn / tokenOut, input amount == amountIn
  *   4. build.minAmountOut == quote.output.minimumAmount (the floor we compare on is the one enforced)
  *   5. tx value == amountIn for native ETH, else 0
+ *   6. the CALLDATA itself (checkLcxCalldata): decodes as one of the router's 5 entrypoints and pays
+ *      exactly what was asked — recipient = wallet, totalIn = amountIn, same tokens, floor >= quote
+ *      floor, matching value, live deadline, and a makerSwap leg only ever targets Bebop
  */
+import { ethers } from "ethers";
 import { env, cfg } from "../config.js";
 import { logger } from "../util/log.js";
 
@@ -26,6 +30,55 @@ const ROUTERS: Record<number, string> = {
 
 export const lcxRouter = (): string | undefined => ROUTERS[cfg.chainId];
 export const lcxEnabled = (): boolean => !!env.lcxKey && !!lcxRouter();
+
+// Router entrypoints (https://dex.lcx.com/docs). On Robinhood Chain the prop-AMM variants are common:
+// tokenized-stock routes go through market-maker pools.
+const LEGS = "tuple(uint256 amountIn, tuple(uint8 family, address pool, address tokenIn, address tokenOut, uint256 aux)[] hops)[]";
+const FEE_ARGS = "tuple(address tokenIn, address tokenOut, uint256 totalIn, uint256 minAmountOut, address recipient, uint256 deadline, address integrator)";
+export const LCX_ROUTER_IFACE = new ethers.Interface([
+  `function swapSplit(address tokenIn, address tokenOut, uint256 totalIn, uint256 minAmountOut, address recipient, uint256 deadline, ${LEGS} legs) payable returns (uint256)`, // 0xfc54261d
+  `function swapSplitWithFee(${FEE_ARGS} a, ${LEGS} legs) payable returns (uint256)`, // 0x5e98574a
+  `function swapSplitViaPropAMM(${FEE_ARGS} a, ${LEGS} legs, address venue, uint256 coreNetOut) payable returns (uint256)`, // 0x195e648e
+  `function swapSplitWithPropAMMSplit(${FEE_ARGS} a, ${LEGS} splitLegs, ${LEGS} fullLegs, tuple(address venue, uint256 venueIn, uint256 venueMinOut) s) payable returns (uint256)`, // 0x31ab353b
+  `function makerSwap(tuple(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut, address recipient, uint256 deadline) a, ${LEGS} poolLegs, tuple(address target, address spender, uint256 amountIn, uint256 minOut, bytes data) m, ${LEGS} fallbackLegs) payable returns (uint256)`, // 0xa565fdcc
+]);
+// the only contracts a makerSwap leg may call / approve (Bebop settlement)
+const BEBOP = new Set(["0xbeb0009aca35087ce7ccf11637e24dd1aad3bf2a", "0xbbbbbbb520d69a9775e85b458c58c648259fad5f"]);
+
+export interface LcxExpect {
+  tokenIn: string; // LCX_NATIVE for ETH
+  tokenOut: string;
+  amountIn: bigint;
+  minOut: bigint; // quote.output.minimumAmount
+  recipient: string;
+}
+
+/** Decode router calldata and check it pays exactly what was asked. "" = OK, else the refusal reason. */
+export function checkLcxCalldata(data: string, value: bigint, x: LcxExpect, nowSec = Math.floor(Date.now() / 1000)): string {
+  let tx: ethers.TransactionDescription | null;
+  try {
+    tx = LCX_ROUTER_IFACE.parseTransaction({ data, value });
+  } catch {
+    return "calldata undecodable";
+  }
+  if (!tx) return `unknown selector ${data.slice(0, 10)}`;
+  const a: any = tx.name === "swapSplit" ? tx.args : tx.args[0]; // wrappers + makerSwap carry the args in `a`
+  const totalIn: bigint = tx.name === "makerSwap" ? a.amountIn : a.totalIn;
+  const same = (u: string, v: string): boolean => u.toLowerCase() === v.toLowerCase();
+  if (!same(a.recipient, x.recipient)) return `recipient ${a.recipient} ≠ wallet`;
+  if (totalIn !== x.amountIn) return `totalIn ${totalIn} ≠ amountIn`;
+  if (!same(a.tokenIn, x.tokenIn) || !same(a.tokenOut, x.tokenOut)) return "calldata tokens ≠ request";
+  if (a.minAmountOut < x.minOut) return `calldata floor ${a.minAmountOut} < quote floor ${x.minOut}`;
+  if (value !== (same(x.tokenIn, LCX_NATIVE) ? totalIn : 0n)) return `value ${value} ≠ ${same(x.tokenIn, LCX_NATIVE) ? totalIn : 0n}`;
+  if (a.deadline <= BigInt(nowSec)) return "deadline passed";
+  if (tx.name === "makerSwap") {
+    const m: any = tx.args[2];
+    if (m.amountIn > 0n && (!BEBOP.has(m.target.toLowerCase()) || !BEBOP.has(m.spender.toLowerCase()) || m.amountIn > totalIn)) {
+      return `makerSwap leg not allowed (target ${m.target})`;
+    }
+  }
+  return "";
+}
 
 export interface LcxPlan {
   to: string;
@@ -86,6 +139,7 @@ export async function lcxPlan(tokenIn: string, tokenOut: string, amountIn: bigin
     else if (BigInt(b.minAmountOut) !== BigInt(q.output.minimumAmount) || BigInt(b.minAmountOut) <= 0n) why = "minAmountOut ≠ quote";
     else if (BigInt(sw.value ?? "0") !== (nativeIn ? amountIn : 0n)) why = `value sanity: got ${sw.value}`;
     else if (typeof sw.data !== "string" || !sw.data.startsWith("0x")) why = "no calldata";
+    else why = checkLcxCalldata(sw.data, BigInt(sw.value ?? "0"), { tokenIn, tokenOut, amountIn, minOut: BigInt(q.output.minimumAmount), recipient });
   } catch {
     why = "malformed response";
   }

@@ -13,6 +13,7 @@ process.env.LCX_API_KEY = "test-key";
 process.env.RH_WALLET_KEY = "0x" + "11".repeat(32); // throwaway test key, never funded
 process.env.LOG_LEVEL = "error";
 const { kyberSwap, KYBER_NATIVE } = await import("../src/chain/kyber.js");
+const { LCX_ROUTER_IFACE } = await import("../src/chain/lcx.js");
 const { wallet, provider } = await import("../src/chain/client.js");
 const { env } = await import("../src/config.js");
 
@@ -28,6 +29,19 @@ let lcxMin = 0n;
 let kyberRouterReply = KYBER_ROUTER;
 let revertOn = ""; // router whose simulation reverts
 let sent: string[] = [];
+let lastQuote: any = null;
+
+/** Router calldata for the last quote, paying `recipient`, as /v1/build would return it. */
+const lcxCalldata = (recipient: string) =>
+  LCX_ROUTER_IFACE.encodeFunctionData("swapSplit", [
+    lastQuote.tokenIn,
+    lastQuote.tokenOut,
+    BigInt(lastQuote.amountIn),
+    lcxMin,
+    recipient,
+    BigInt(Math.floor(Date.now() / 1000) + 120),
+    [{ amountIn: BigInt(lastQuote.amountIn), hops: [{ family: 1, pool: KYBER_ROUTER, tokenIn: lastQuote.tokenIn, tokenOut: lastQuote.tokenOut, aux: 0n }] }],
+  ]);
 
 globalThis.fetch = (async (url: string, init?: RequestInit) => {
   const u = String(url);
@@ -36,6 +50,7 @@ globalThis.fetch = (async (url: string, init?: RequestInit) => {
   if (u.includes("/route/build"))
     return json({ code: 0, data: { routerAddress: kyberRouterReply, amountIn: AMT.toString(), amountOut: kyberOut.toString(), transactionValue: AMT.toString(), data: "0xaaaa" } });
   const body = JSON.parse(String(init?.body ?? "{}"));
+  if (u.endsWith("/v1/quote")) lastQuote = body;
   if (u.endsWith("/v1/quote"))
     return json({
       success: true,
@@ -50,7 +65,7 @@ globalThis.fetch = (async (url: string, init?: RequestInit) => {
       },
     });
   if (u.endsWith("/v1/build"))
-    return json({ success: true, data: { swap: { chainId: 4663, to: LCX_ROUTER, data: "0x1c1c", value: AMT.toString() }, minAmountOut: lcxMin.toString(), routerDeployed: true } });
+    return json({ success: true, data: { swap: { chainId: 4663, to: LCX_ROUTER, data: lcxCalldata(body.recipient), value: AMT.toString() }, minAmountOut: lcxMin.toString(), routerDeployed: true } });
   throw new Error(`unexpected fetch ${u}`);
 }) as typeof fetch;
 
