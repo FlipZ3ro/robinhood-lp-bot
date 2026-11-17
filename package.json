@@ -10,6 +10,7 @@
     "start": "node --env-file-if-exists=.env --import tsx src/index.ts",
     "dev": "node --env-file-if-exists=.env --watch --import tsx src/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "build": "tsc"
   },
   "keywords": [

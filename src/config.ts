@@ -258,6 +258,9 @@ export const env = {
   kyberBase: (process.env.KYBERSWAP_AGGREGATOR_API_BASE_URL || "https://aggregator-api.kyberswap.com").trim().replace(/\/$/, ""),
   kyberChain: (process.env.KYBERSWAP_CHAIN || "robinhood").trim(),
   kyberRouter: (process.env.KYBERSWAP_ROUTER_ADDRESS || "").trim(),
+  // LCX Liberty DEX (optional) — a second aggregator quoted next to Kyber; the swap guaranteeing the
+  // larger minimum output executes. Empty = Kyber only, exactly as before. See chain/lcx.ts.
+  lcxKey: (process.env.LCX_API_KEY || "").trim(),
 };
 
 /** Fail fast at startup if a required secret is missing or malformed. */
