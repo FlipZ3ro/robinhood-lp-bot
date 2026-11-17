@@ -137,6 +137,7 @@ Now open `.env` and fill in:
 | `RH_WATCH_RPC_URL` | (optional) a second Alchemy app for the scanner. Leaving it blank is fine |
 | `RH_OPENROUTER_KEY` | (optional) [openrouter.ai/keys](https://openrouter.ai/keys) — enables the LLM radar |
 | `KYBERSWAP_*` | (optional) KyberSwap aggregator endpoint — for best-route swaps (see `.env.example`) |
+| `LCX_API_KEY` | (optional) [dex.lcx.com/dashboard](https://dex.lcx.com/dashboard) — LCX Liberty DEX is quoted next to Kyber on every swap; the higher guaranteed minimum output executes (needs `KYBERSWAP_*` set too) |
 
 Generate a fresh wallet quickly:
 ```bash
@@ -402,6 +403,7 @@ src/
 ├── chain/                everything blockchain
 │   ├── client.ts         providers (LP + watch), wallet, gas, fast-submit routing
 │   ├── kyber.ts          KyberSwap aggregator (quote + build, 4 security gates)
+│   ├── lcx.ts            LCX Liberty DEX (optional, compared with Kyber per swap)
 │   ├── positions.ts      v3 open / list / close + USDG single-side & in-range (Uniswap SDK math)
 │   ├── pools.ts          findPools, poolState, range math (SDK)
 │   ├── swaps.ts          quote + swap v3 (slippage floor)
